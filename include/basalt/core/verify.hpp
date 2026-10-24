@@ -328,7 +328,7 @@ private:
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
-    bool dm_pcie_check(std::string& err);  ///< --exp dm_pcie_check=1: the PCIe tier's table against a recompute
+    bool dm_pcie_check(const std::vector<size_t>& changed, std::string& err);   ///< --exp dm_pcie_check: the PCIe tier's table (1), its bytes (2)
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
     bool dm_end(std::string& err);         ///< the peer window's end
     void dm_free();

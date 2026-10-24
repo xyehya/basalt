@@ -111,7 +111,9 @@ struct DecMoe {
     unsigned long long* ptab_pcie = nullptr;
     std::vector<unsigned long long> alias_sh;   ///< what ptab_pcie holds
     int pcie_num = 0;                           ///< the share in 256ths; 0: the tier is off (no nodes recorded)
-    bool pcie_check = false;                    ///< --exp dm_pcie_check=1: the device table is compared with a recompute
+    size_t pcie_cursor = 0;                     ///< dm_pcie_check=2: where its rotating sample goes on
+    int64_t pcie_checked = 0;                   ///< the entries whose bytes it has compared
+    int pcie_check = 0;                         ///< --exp dm_pcie_check: 1 the device table against a recompute, 2 also the bytes behind some entries
     int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
@@ -559,7 +561,7 @@ bool Verifier::dm_init(std::string& err) {
             return false;
         } else {
             d->pcie_num = pcie_num_;
-            d->pcie_check = basalt::core::exp_flag("dm_pcie_check", 0) != 0;
+            d->pcie_check = (int) basalt::core::exp_flag("dm_pcie_check", 0);
             d->alias_sh.assign((size_t) LE, 0ull);
             basalt::log::info("basalt verify", "the PCIe tier takes %.2f of the distinct misses (%lld of %lld experts readable by the GPU)",
                               (double) pcie_num_ / 256.0, (long long) readable, (long long) LE);
@@ -692,7 +694,7 @@ bool Verifier::dm_sync(std::string& err) {
             return false;
         }
     }
-    if (d->pcie_check && d->ptab_pcie != nullptr && !dm_pcie_check(err)) return false;
+    if (d->pcie_check > 0 && d->ptab_pcie != nullptr && !dm_pcie_check(changed, err)) return false;
     if (d->pdev >= 0 && span(peer_->residency().data(), d->shadow1, a, b)) {
         decode_events().tag(1u << 5);
         const int32_t* src = d->shadow1.data() + a;
@@ -716,8 +718,11 @@ bool Verifier::dm_sync(std::string& err) {
 }
 
 // --exp dm_pcie_check=1: the device table against a recompute from the expert source.  A stale non-zero entry (an address
-// whose place the expert no longer holds) would make the GPU compute an expert from another's bytes.
-bool Verifier::dm_pcie_check(std::string& err) {
+// whose place the expert no longer holds) would make the GPU compute an expert from another's bytes.  =2 also reads the bytes
+// behind some entries through their addresses (the ones that changed at this sync and a rotating sample of the rest) and compares
+// them with the model file's.  The invariant behind the tier: a place named by the table is not written while its expert is a
+// miss in a window in flight; swaps run between windows.
+bool Verifier::dm_pcie_check(const std::vector<size_t>& changed, std::string& err) {
     DecMoe* d = dm_;
     const size_t LE = d->shadow0.size(), ne = (size_t) g_->n_expert;
     std::vector<unsigned long long> dev(LE);
@@ -736,6 +741,26 @@ bool Verifier::dm_pcie_check(std::string& err) {
     if (stale != 0) {
         err = "verify: the PCIe tier's table holds " + std::to_string(stale) + " stale addresses";
         return false;
+    }
+    const auto* files = d->pcie_check > 1 ? dynamic_cast<const FileExpertSource*>(pcie_src_) : nullptr;
+    if (files == nullptr) return true;
+    std::vector<size_t> pick;
+    for (const size_t i : changed)
+        if (dev[i] != 0 && pick.size() < 4) pick.push_back(i);
+    for (size_t tries = 0; tries < LE && pick.size() < 8; ++tries) {
+        d->pcie_cursor = (d->pcie_cursor + 7919) % LE;
+        if (dev[d->pcie_cursor] != 0) pick.push_back(d->pcie_cursor);
+    }
+    std::vector<uint8_t> bytes;
+    for (const size_t i : pick) {
+        const int64_t l = (int64_t) (i / ne), e = (int64_t) (i % ne);
+        bytes.resize((size_t) basalt::kernels::cpu::expert_layout().blob_bytes(l));
+        if (cudaMemcpy(bytes.data(), (const void*) dev[i], bytes.size(), cudaMemcpyDefault) != cudaSuccess ||
+            !files->equals_file(l, e, bytes.data())) {
+            err = "verify: the PCIe tier's table names a place that does not hold layer " + std::to_string(l) + " expert " + std::to_string(e);
+            return false;
+        }
+        ++d->pcie_checked;
     }
     return true;
 }
@@ -768,6 +793,8 @@ void Verifier::dm_free() {
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0, (void*) d->ptab_pcie})
         if (p) cudaFree(p);
+    if (d->pcie_check > 1)
+        basalt::log::info("basalt verify", "the PCIe tier's bytes: %lld table entries compared with the model file", (long long) d->pcie_checked);
     if (d->pin) cudaFreeHost(d->pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
         if (h) cudaFreeHost(h);
