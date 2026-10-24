@@ -144,6 +144,76 @@ __device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int t
     rank_out = rank;
 }
 
+// ---------------------------------------------------------------- PCIe tier
+// Of the distinct experts that would go to the CPU pool and that the GPU can read from the mapped arena (tab[e] != 0), the
+// last num / 256 in routing order (at most kDmPcieMax) become kind 1: all their entries, whole groups.  A candidate is a valid
+// id not repeated within its token, as the VRAM tier requires.  With `plan` the groups also go to its ptr2 / start2 / dst2 /
+// tok2 (entries numbered from 0) and pcie[0], pcie[1].  Every thread of the block calls it; returns the groups taken.
+__device__ int dm_pcie_tier(const int32_t* s_ids, int32_t* s_kind, int n, int k, int n_expert, const unsigned long long* tab,
+                            int num, DmPlan* plan, int tid) {
+    __shared__ int32_t s_cand[kDmCap], s_first[kDmCap], s_gcnt[kDmCap];
+    int e = -1;
+    bool cand = false;
+    if (tid < n) {
+        e = s_ids[tid];
+        cand = s_kind[tid] < 0 && e >= 0 && e < n_expert && tab[e] != 0ull;
+        for (int j = tid - tid % k; cand && j < tid; ++j) cand = s_ids[j] != e;
+    }
+    if (tid < kDmCap) s_cand[tid] = cand;
+    __syncthreads();
+    int first = tid, cnt = 0;
+    if (cand) {
+        first = -1;
+        for (int j = 0; j < n; ++j)
+            if (s_cand[j] && s_ids[j] == e) {
+                if (first < 0) first = j;
+                ++cnt;
+            }
+    }
+    if (tid < kDmCap) {
+        s_first[tid] = cand && first == tid;
+        s_gcnt[tid] = cand && first == tid ? cnt : 0;
+    }
+    __syncthreads();
+    int ng = 0;
+    for (int j = 0; j < n; ++j) ng += s_first[j];
+    const int m = min(min((ng * num) >> 8, kDmPcieMax), ng);
+    const int skip = ng - m;   // the first `skip` groups stay with the CPU
+    int rank = 0, gs = 0;
+    if (cand)
+        for (int j = 0; j < first; ++j)
+            if (s_first[j]) {
+                if (rank >= skip) gs += s_gcnt[j];
+                ++rank;
+            }
+    if (cand && rank >= skip) {
+        s_kind[tid] = 1;
+        if (plan != nullptr) {
+            int in_group = 0;
+            for (int j = 0; j < tid; ++j) in_group += s_cand[j] && s_ids[j] == e;
+            plan->dst2[gs + in_group] = tid;
+            plan->tok2[gs + in_group] = tid / k;
+            if (first == tid) {
+                plan->ptr2[rank - skip] = tab[e];
+                plan->start2[rank - skip] = gs;
+            }
+        }
+    }
+    if (plan != nullptr && tid == 0) {
+        int ne = 0, q = 0;
+        for (int j = 0; j < n; ++j)
+            if (s_first[j]) {
+                if (q >= skip) ne += s_gcnt[j];
+                ++q;
+            }
+        plan->start2[m] = ne;
+        plan->pcie[0] = m;
+        plan->pcie[1] = ne;
+    }
+    __syncthreads();
+    return m;
+}
+
 // Block 0 plans CUDA0's groups and publishes the ring's header; the other blocks quantize the FFN input (256 values
 // each) into the device q8_1 rows and, for the tiers that need them, into mapped memory.  The last block to finish
 // rings both doorbells.  Mode 1 keeps only the plan and the device rows, mode 2 only the ring (DmRouteArgs::mode).
@@ -187,6 +257,10 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         if (pe && rank >= a.peer_cap) s_kind[tid] = -1;
         __syncthreads();
     }
+    int n_pcie = 0;
+    if (a.pcie_tab != nullptr && a.pcie_num > 0)
+        n_pcie = dm_pcie_tier(s_ids, s_kind, n, a.k, a.n_expert, a.pcie_tab, a.pcie_num,
+                              blockIdx.x == 0 && (a.mode != 2 || a.kinds) ? a.plan : nullptr, tid);
     if (tid < n) {
         if (s_kind[tid] < 0) atomicAdd(&s_ncpu, 1);
         else if (s_kind[tid] == 2) atomicAdd(&s_npeer, 1);
@@ -212,6 +286,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
             r->n_vram = ne;
             r->n_peer = s_npeer;
             r->n_cpu = s_ncpu;
+            r->n_pcie = n_pcie;
         }
     } else if (blockIdx.x == 0) {
         DmPlan* p = a.plan;
@@ -246,6 +321,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
             r->n_vram = s_ne;
             r->n_peer = s_npeer;
             r->n_cpu = s_ncpu;
+            r->n_pcie = n_pcie;
         }
     } else {
         const long long i = (long long) (blockIdx.x - 1) * kDmThreads + tid;
@@ -366,10 +442,13 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
         if (pe && rank >= a.peer_cap) r_kind[tid] = -1;
         __syncthreads();
     }
+    int r_npcie = 0;
+    if (a.pcie_tab != nullptr && a.pcie_num > 0)
+        r_npcie = dm_pcie_tier(r_ids, r_kind, n, a.k, a.n_expert, a.pcie_tab, a.pcie_num, a.kinds ? a.plan : nullptr, tid);
     if (tid < n) {
         if (r_kind[tid] < 0) atomicAdd(&r_ncpu, 1);
         else if (r_kind[tid] == 2) atomicAdd(&r_npeer, 1);
-        else atomicAdd(&r_nvram, 1);
+        else if (r_kind[tid] == 0) atomicAdd(&r_nvram, 1);
     }
     __syncthreads();
     if (tid < n) {
@@ -384,6 +463,7 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
         r->n_vram = r_nvram;
         r->n_peer = r_npeer;
         r->n_cpu = r_ncpu;
+        r->n_pcie = r_npcie;
         if (a.kinds) {
             a.plan->counts[2] = r_npeer;
             a.plan->counts[3] = r_ncpu;
