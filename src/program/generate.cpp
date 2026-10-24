@@ -450,6 +450,10 @@ struct Options {
     /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the pinned arena while the
     /// CPU computes the rest (host-planned verify windows).  Set from the startup link probe.
     double pcie_frac = -1.0;
+    /// The share (0..1) of each layer's distinct missed experts the GPU reads over PCIe in the device-planned decode
+    /// window (its own tier, separate from the host-planned share above); 0 = off.  Set after the link probe.
+    double dm_pcie_frac = 0.0;
+    bool dm_pcie_forced = false;   ///< --exp dm_pcie=F was given: no startup guard
     /// Every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into the VRAM tier in
     /// place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
@@ -1204,6 +1208,14 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// The device-planned window's PCIe share: kDmPcieBase for a link of kDmPcieLinkGbps (the link its stage time was measured on), in
+// proportion below that (a slower link makes the GPU stage longer than the CPU's).  --exp dm_pcie=F replaces it (0: off); the
+// verifier also leaves the tier off when the cache is big enough that a layer has too few distinct misses.
+constexpr double kDmPcieBase = 0.35, kDmPcieLinkGbps = 57.0;
+double dm_pcie_frac_for_gbps(double gbps) {
+    return gbps <= 0.0 ? kDmPcieBase : kDmPcieBase * std::min(1.0, gbps / kDmPcieLinkGbps);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1937,6 +1949,9 @@ int main(int argc, char** argv) {
         const double base = 0.55;
         std::string bursts;
         const double bw = probe_pcie_h2d_gbps(&bursts);
+        o.dm_pcie_forced = basalt::core::exp_flag("dm_pcie", -1.0) >= 0.0;
+        o.dm_pcie_frac = o.dm_pcie_forced ? basalt::core::exp_flag("dm_pcie", 0.0) : dm_pcie_frac_for_gbps(bw);
+        o.dm_pcie_frac = std::min(1.0, o.dm_pcie_frac);
         if (bw > 0.0) {
             o.pcie_frac = pcie_frac_for_gbps(bw, base);
             basalt::log::info("basalt generate", "PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
@@ -5141,6 +5156,7 @@ int main(int argc, char** argv) {
         ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
         if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
+        ver.set_pcie_tier(drive.d.src, std::max(0, std::min(256, (int) (o.dm_pcie_frac * 256.0 + 0.5))), !o.dm_pcie_forced);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
             (mtp_on && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err))) {
             basalt::log::error("basalt serve", "%s", err.c_str());
@@ -9342,6 +9358,7 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
         vh.n_slots = xcache.slots();
         ver.set_cpu_warm(drive.d.pool, drive.d.src);
+        ver.set_pcie_tier(drive.d.src, std::max(0, std::min(256, (int) (o.dm_pcie_frac * 256.0 + 0.5))), !o.dm_pcie_forced);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             return fatal_start_error(err);
         }
@@ -9616,10 +9633,10 @@ int main(int argc, char** argv) {
                         "expert tiers", (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         (double) (src.file_read_bytes() - fall0) / 1e6);
         }
-        if (rounds > 0 && drive.d.pcie_num > 0)
+        if (rounds > 0 && (drive.d.pcie_num > 0 || o.dm_pcie_frac > 0.0))
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
-                        drive.d.pcie_num);
+                        o.dm_pcie_frac > 0.0 ? (int) (o.dm_pcie_frac * 256.0 + 0.5) : drive.d.pcie_num);
         (void) pool_ms0;
         if (use_mtp && rounds > 0)
             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",

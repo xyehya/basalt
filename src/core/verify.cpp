@@ -107,6 +107,13 @@ struct DecMoe {
     unsigned int* vsync = nullptr;           ///< its counters
     unsigned long long* wstat = nullptr;   // the per-layer wait counters (device), with --wait-stats
     unsigned long long* ptab0 = nullptr;   // [n_layers * n_expert] CUDA0 blob address or 0
+    // the PCIe tier: [n_layers * n_expert] the blob's address in the mapped arena for a miss the GPU can read, else 0
+    unsigned long long* ptab_pcie = nullptr;
+    std::vector<unsigned long long> alias_sh;   ///< what ptab_pcie holds
+    int pcie_num = 0;                           ///< the share in 256ths; 0: the tier is off (no nodes recorded)
+    size_t pcie_cursor = 0;                     ///< dm_pcie_check=2: where its rotating sample goes on
+    int64_t pcie_checked = 0;                   ///< the entries whose bytes it has compared
+    int pcie_check = 0;                         ///< --exp dm_pcie_check: 1 the device table against a recompute, 2 also the bytes behind some entries
     int64_t wstat_windows = 0, wstat_t = 0;
     // mapped: per ring header, FFN input and q8_1 rows; [0] the peer's ring, [16] its done ring, [32] its abort
     // record (kDmDiagWords); the peer's rows
@@ -142,6 +149,10 @@ struct DecMoe {
 namespace {
 
 constexpr float EPS = 1e-6f;
+// the PCIe tier's startup guard: its distinct misses a layer must reach, the entries a window routes per layer (about 4.5 tokens of
+// 10 experts), the part of those entries that are distinct experts, and the hit rate as a line in the cache's share of the experts
+constexpr double kDmPcieMinMisses = 8.0, kDmWindowEntries = 45.0, kDmDistinctRatio = 0.75;
+constexpr double kDmFrac = 0.126, kDmHitAtFrac = 0.60, kDmHitSlope = 1.53;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -523,9 +534,42 @@ bool Verifier::dm_init(std::string& err) {
         ok = cudaMalloc((void**) &d->wstat, kDmStatWords * 8) == cudaSuccess &&
              cudaMemset(d->wstat, 0, kDmStatWords * 8) == cudaSuccess;
     if (!ok) { err = "verify: device-planned MoE buffers"; return false; }
+    if (ok && pcie_src_ != nullptr && pcie_num_ > 0 && pcie_guarded_) {
+        // the distinct misses a layer is expected to have: the cache's share of the experts sets the hit rate (a line fitted to two
+        // measured placements), a window routes about kDmWindowEntries entries of which a part repeats an expert
+        int64_t resident = 0;
+        for (int64_t i = 0; i < LE; ++i) resident += hits_.h_res[i] >= 0;
+        const double frac = (double) resident / (double) LE;
+        const double hit = std::min(0.97, std::max(0.0, kDmHitAtFrac + kDmHitSlope * (frac - kDmFrac)));
+        const double distinct = kDmWindowEntries * kDmDistinctRatio * (1.0 - hit);
+        if (distinct < kDmPcieMinMisses) {
+            basalt::log::info("basalt verify", "the PCIe tier is off: the cache holds %.0f%% of the experts, about %.1f distinct misses a layer "
+                              "(too few for it to pay)", 100.0 * frac, distinct);
+            pcie_num_ = 0;
+        }
+    }
+    if (ok && pcie_src_ != nullptr && pcie_num_ > 0) {
+        // the PCIe tier needs experts the GPU can read in the mapped arena (a refused page-lock leaves none)
+        int64_t readable = 0;
+        for (int64_t i = 0; i < LE; ++i)
+            if (hits_.h_res[i] < 0 && pcie_src_->device_alias(i / g.n_expert, i % g.n_expert) != nullptr) ++readable;
+        if (readable == 0) {
+            basalt::log::warn("basalt verify", "the PCIe tier is off: no expert is readable by the GPU in the mapped arena");
+        } else if (cudaMalloc((void**) &d->ptab_pcie, (size_t) LE * 8) != cudaSuccess ||
+                   cudaMemset(d->ptab_pcie, 0, (size_t) LE * 8) != cudaSuccess) {
+            err = "verify: PCIe tier table";
+            return false;
+        } else {
+            d->pcie_num = pcie_num_;
+            d->pcie_check = (int) basalt::core::exp_flag("dm_pcie_check", 0);
+            d->alias_sh.assign((size_t) LE, 0ull);
+            basalt::log::info("basalt verify", "the PCIe tier takes %.2f of the distinct misses (%lld of %lld experts readable by the GPU)",
+                              (double) pcie_num_ / 256.0, (long long) readable, (long long) LE);
+        }
+    }
     d->shadow0.assign((size_t) LE, INT32_MIN);
     d->shadow1.assign((size_t) LE, -1);
-    d->pin_stride = (size_t) LE * 24;   // [res0 | ptab0 | res1 | ptab1] per slot
+    d->pin_stride = (size_t) LE * 32;   // [res0 | ptab0 | res1 | ptab1 | alias] per slot
     if (cudaHostAlloc((void**) &d->pin, d->pin_stride * DecMoe::kPinSlots, cudaHostAllocPortable) != cudaSuccess) {
         cudaGetLastError();
         d->pin = nullptr;
@@ -586,14 +630,18 @@ bool Verifier::dm_init(std::string& err) {
 // Each upload is queued on the stream that reads it (CUDA0's window, the peer's): a plain cudaMemcpy from pageable
 // memory may return before its DMA lands, and the window's route kernel would then read a table half old, half new
 // (an expert with two tiers in one ring).
+// Runs on the thread that owns the window's stream state: the main thread at the window's start, or the swap thread through
+// dm_presync between windows; the two never overlap (the swap thread is joined before the next window), which is what keeps
+// shadow0, alias_sh and the pinned slots unlocked.  Keep it so, or lock them.
 bool Verifier::dm_sync(std::string& err) {
     DecMoe* d = dm_;
     const size_t LE = d->shadow0.size();
-    auto span = [&](const int32_t* now, std::vector<int32_t>& sh, size_t& a, size_t& b) {
+    std::vector<size_t> changed;   // res0's changed indices (for the PCIe tier's table)
+    auto span = [&](const int32_t* now, std::vector<int32_t>& sh, size_t& a, size_t& b, std::vector<size_t>* ch = nullptr) {
         a = LE; b = 0;
         if (std::memcmp(now, sh.data(), LE * 4) == 0) return false;
         for (size_t i = 0; i < LE; ++i)
-            if (now[i] != sh[i]) { if (a == LE) a = i; b = i + 1; }
+            if (now[i] != sh[i]) { if (a == LE) a = i; b = i + 1; if (ch) ch->push_back(i); }
         if (a < b) std::memcpy(sh.data() + a, now + a, (b - a) * 4);
         return a < b;
     };
@@ -607,7 +655,7 @@ bool Verifier::dm_sync(std::string& err) {
     unsigned long long* const pin_ptab0 = (unsigned long long*) (pin + (pin ? (size_t) LE * 4 : 0));
     int32_t* const pin_res1 = (int32_t*) (pin + (pin ? (size_t) LE * 12 : 0));
     unsigned long long* const pin_ptab1 = (unsigned long long*) (pin + (pin ? (size_t) LE * 16 : 0));
-    const bool up0 = span(hits_.h_res, d->shadow0, a, b);
+    const bool up0 = span(hits_.h_res, d->shadow0, a, b, d->ptab_pcie != nullptr ? &changed : nullptr);
     if (up0) {
         decode_events().tag(1u << 4);
         const int32_t* src = d->shadow0.data() + a;
@@ -632,6 +680,21 @@ bool Verifier::dm_sync(std::string& err) {
             return false;
         }
     }
+    if (d->ptab_pcie != nullptr && !changed.empty()) {   // the tier's table: a miss's mapped address, 0 for a resident expert
+        const size_t ne = (size_t) g_->n_expert;
+        for (const size_t i : changed)
+            d->alias_sh[i] = d->shadow0[i] < 0 ? (unsigned long long) pcie_src_->device_alias((int64_t) (i / ne), (int64_t) (i % ne)) : 0ull;
+        unsigned long long* const pin_alias = (unsigned long long*) (pin + (pin ? (size_t) LE * 24 : 0));
+        std::vector<unsigned long long> av;
+        unsigned long long* p = pin_alias + a;
+        if (!pin) { av.resize(b - a); p = av.data(); }
+        std::memcpy(p, d->alias_sh.data() + a, (b - a) * 8);
+        if (cudaMemcpyAsync(d->ptab_pcie + a, p, (b - a) * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+            err = "verify: PCIe tier table upload";
+            return false;
+        }
+    }
+    if (d->pcie_check > 0 && d->ptab_pcie != nullptr && !dm_pcie_check(changed, err)) return false;
     if (d->pdev >= 0 && span(peer_->residency().data(), d->shadow1, a, b)) {
         decode_events().tag(1u << 5);
         const int32_t* src = d->shadow1.data() + a;
@@ -650,6 +713,54 @@ bool Verifier::dm_sync(std::string& err) {
             err = "verify: device-planned MoE peer table upload";
             return false;
         }
+    }
+    return true;
+}
+
+// --exp dm_pcie_check=1: the device table against a recompute from the expert source.  A stale non-zero entry (an address
+// whose place the expert no longer holds) would make the GPU compute an expert from another's bytes.  =2 also reads the bytes
+// behind some entries through their addresses (the ones that changed at this sync and a rotating sample of the rest) and compares
+// them with the model file's.  The invariant behind the tier: a place named by the table is not written while its expert is a
+// miss in a window in flight; swaps run between windows.
+bool Verifier::dm_pcie_check(const std::vector<size_t>& changed, std::string& err) {
+    DecMoe* d = dm_;
+    const size_t LE = d->shadow0.size(), ne = (size_t) g_->n_expert;
+    std::vector<unsigned long long> dev(LE);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess ||
+        cudaMemcpy(dev.data(), d->ptab_pcie, LE * 8, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "verify: PCIe tier table check";
+        return false;
+    }
+    size_t stale = 0, lost = 0;
+    for (size_t i = 0; i < LE; ++i) {
+        const unsigned long long want = d->shadow0[i] < 0 ? (unsigned long long) pcie_src_->device_alias((int64_t) (i / ne), (int64_t) (i % ne)) : 0ull;
+        if (dev[i] == want) continue;
+        if (dev[i] != 0) ++stale; else ++lost;
+    }
+    if (lost != 0) basalt::log::info("basalt verify", "the PCIe tier's table: %zu experts readable but not in it", lost);
+    if (stale != 0) {
+        err = "verify: the PCIe tier's table holds " + std::to_string(stale) + " stale addresses";
+        return false;
+    }
+    const auto* files = d->pcie_check > 1 ? dynamic_cast<const FileExpertSource*>(pcie_src_) : nullptr;
+    if (files == nullptr) return true;
+    std::vector<size_t> pick;
+    for (const size_t i : changed)
+        if (dev[i] != 0 && pick.size() < 4) pick.push_back(i);
+    for (size_t tries = 0; tries < LE && pick.size() < 8; ++tries) {
+        d->pcie_cursor = (d->pcie_cursor + 7919) % LE;
+        if (dev[d->pcie_cursor] != 0) pick.push_back(d->pcie_cursor);
+    }
+    std::vector<uint8_t> bytes;
+    for (const size_t i : pick) {
+        const int64_t l = (int64_t) (i / ne), e = (int64_t) (i % ne);
+        bytes.resize((size_t) basalt::kernels::cpu::expert_layout().blob_bytes(l));
+        if (cudaMemcpy(bytes.data(), (const void*) dev[i], bytes.size(), cudaMemcpyDefault) != cudaSuccess ||
+            !files->equals_file(l, e, bytes.data())) {
+            err = "verify: the PCIe tier's table names a place that does not hold layer " + std::to_string(l) + " expert " + std::to_string(e);
+            return false;
+        }
+        ++d->pcie_checked;
     }
     return true;
 }
@@ -680,8 +791,10 @@ void Verifier::dm_free() {
     }
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
-                    (void*) d->ptab0})
+                    (void*) d->ptab0, (void*) d->ptab_pcie})
         if (p) cudaFree(p);
+    if (d->pcie_check > 1)
+        basalt::log::info("basalt verify", "the PCIe tier's bytes: %lld table entries compared with the model file", (long long) d->pcie_checked);
     if (d->pin) cudaFreeHost(d->pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
         if (h) cudaFreeHost(h);
@@ -1145,6 +1258,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const bool dm = dm_ != nullptr && (!batch_rec_ || batch_dm_);   // the device-planned tail (one group)
+    const bool pcie_tier = dm && !batch_rec_ && dm_->pcie_num > 0;   // misses the GPU reads from the mapped arena
     // each hyper-connection read (and the FFN read's router) as one kernel; the next read's w_norm is prefetched into
     // L2 at its end
     const bool dec_hc = hc_fused_supported();
@@ -1899,6 +2013,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.ring = (uint32_t) (r + 1); ra.ctr = dm_->ctr;
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
+            if (pcie_tier) { ra.pcie_tab = dm_->ptab_pcie + l * g.n_expert; ra.pcie_num = dm_->pcie_num; }
             ra.rows = dm_->rq != nullptr || dm_->warm != nullptr;
             PdlScope pr(false);   // after the router's kernel: a plain launch
             if (glue_on) {   // the ring's work inside post's gate/up launch
@@ -2023,6 +2138,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             else
                 native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                       nat_xq_, hit_scratch_, parts_out, cs);
+            if (pcie_tier) {   // the PCIe groups: staged by the copy kernel, then computed from staging into their parts rows
+                fetch_blobs(P->ptr2, P->pcie, staging_, (int64_t) lay.blob_bytes(l), (int) kStagingBlobs, cs);
+                rebase_ptrs(P->ptr2, P->pcie, staging_, (int64_t) lay.blob_bytes(l), cs);
+                native_expert_grouped(L, P->ptr2, P->start2, P->pcie, P->dst2, P->tok2, cap, cap,
+                                      nat_xq_, hit_scratch_, parts_out, cs, kPcieGroupRows);
+            }
             stamp(l, 20);
             stamp(l, 21);
             stamp(l, 22);
@@ -2917,6 +3038,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const double nw = (double) dm_->wstat_windows;
         basalt::log::raw("basalt verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
                      dm_->wstat_t / nw, basalt::kernels::dec_moe_stats_text(w.data(), nw).c_str());
+        if (dm_->pcie_num > 0) {   // who ends later, CUDA0 (VRAM glue and PCIe stage) or the CPU pool: the share is balanced near half
+            unsigned long long layers = 0, waited = 0;
+            for (int b = 0; b < 16; ++b) {
+                layers += w[(size_t) basalt::kernels::kDmStatBucket + 8 * (size_t) b];
+                waited += w[(size_t) basalt::kernels::kDmStatBucket + 8 * (size_t) b + 1];
+            }
+            if (layers > 0)
+                basalt::log::info("basalt verify", "the CPU pool's rows landed after CUDA0's own work in %.0f%% of the layers%s",
+                                  100.0 * (double) waited / (double) layers,
+                                  2 * waited < layers ? " (the PCIe stage is the later one: a lower share is faster)" : "");
+        }
         dm_->wstat_windows = 0;
         dm_->wstat_t = 0;
     }
