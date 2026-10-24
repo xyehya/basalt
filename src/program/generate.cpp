@@ -1207,9 +1207,10 @@ double pcie_frac_for_gbps(double gbps, double base) {
 }
 
 // The device-planned window's PCIe share: kDmPcieBase for a link of kDmPcieLinkGbps (the link its stage time was measured on), in
-// proportion below that (a slower link makes the GPU stage longer than the CPU's).  --exp dm_pcie=F replaces it (0: off); the
-// verifier also leaves the tier off when the cache is big enough that a layer has too few distinct misses.
-constexpr double kDmPcieBase = 0.35, kDmPcieLinkGbps = 57.0;
+// proportion below that (a slower link makes the GPU stage longer than the CPU's).  The base is 0: the tier is opt-in through
+// --exp dm_pcie=F, which replaces the rule; with a base above 0 the verifier also leaves the tier off when the cache is big enough
+// that a layer has too few distinct misses.
+constexpr double kDmPcieBase = 0.0, kDmPcieLinkGbps = 57.0;
 double dm_pcie_frac_for_gbps(double gbps) {
     return gbps <= 0.0 ? kDmPcieBase : kDmPcieBase * std::min(1.0, gbps / kDmPcieLinkGbps);
 }
