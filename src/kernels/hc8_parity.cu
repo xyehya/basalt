@@ -14,7 +14,8 @@
 //   2. Gemm::bf16_w (the prompt path's product on a copy) against Gemm::bf16 on the bf16 matrix and against a
 //      double-precision product with the copy's exact values, on the prompt path's hc shapes, with a scratch that holds
 //      the whole matrix and with one that slices it (within fp32 rounding: cuBLAS's kernel can change with the width).
-//   3. --bench: the read's time (weights cold in L2) and the products' time against the bf16 ones.
+//   3. --bench: the read's time (weights cold in L2), plain and as a programmatic dependent, and the products' time against
+//      the bf16 ones.  Per-kernel times (norm, down, up): `nsys profile build/hc8_parity --bench`, kernels hc8_*.
 //
 //     build/hc8_parity [--bench]
 #include "basalt/kernels/fused_gr.hpp"
@@ -477,6 +478,17 @@ int main(int argc, char** argv) {
             const double u16 = time_us([&] { K::fused_gr_read_multi(a[1], T, o[1].xn, st); }, 50, true);
             std::printf("read T %d (cold L2): 8-bit %.1f us (%.0f GB/s of %.1f MB) | bf16 fused_gr %.1f us (%.0f GB/s of %.1f MB)\n",
                         T, u8, b8 / u8 / 1e3, b8 / 1e6, u16, b16 / u16 / 1e3, b16 / 1e6);
+            // the same read behind a kernel that leaves its data alone: plain, and started early as a programmatic dependent
+            const double ub = time_us([&] {
+                K::hc8_dequant_bf16(vi, 0, HC, dqi, st);
+                K::fused_gr_read_multi(a[0], T, o[0].xn, st);
+            }, 50, true);
+            const double ue = time_us([&] {
+                K::hc8_dequant_bf16(vi, 0, HC, dqi, st);
+                K::PdlScope scope(true, false);
+                K::fused_gr_read_multi(a[0], T, o[0].xn, st);
+            }, 50, true);
+            std::printf("read T %d behind a kernel (cold L2): plain %.1f us | early start %.1f us\n", T, ub, ue);
         }
         for (int64_t T : {512, 2048, 8192}) {
             uint16_t* dX;
