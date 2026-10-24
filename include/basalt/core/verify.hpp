@@ -123,6 +123,9 @@ public:
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
     void set_cpu_warm(basalt::kernels::cpu::ExpertPool* pool, ExpertSource* src) { warm_pool_ = pool; warm_src_ = src; }
+    /// The PCIe tier of the device-planned tail: `src` serves the pinned, mapped blobs the GPU reads, `num`/256 of each
+    /// layer's distinct misses (the last in routing order) go to it.  0 or null: off.  Before init.
+    void set_pcie_tier(ExpertSource* src, int num) { pcie_src_ = src; pcie_num_ = num; }
 
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -317,9 +320,12 @@ private:
     PeerExperts* peer_ = nullptr;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
     ExpertSource* warm_src_ = nullptr;
+    ExpertSource* pcie_src_ = nullptr;
+    int pcie_num_ = 0;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
+    bool dm_pcie_check(std::string& err);  ///< --exp dm_pcie_check=1: the PCIe tier's table against a recompute
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
     bool dm_end(std::string& err);         ///< the peer window's end
     void dm_free();
