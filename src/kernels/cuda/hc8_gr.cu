@@ -27,6 +27,7 @@ constexpr int G8 = 32;
 constexpr int DOWN_ROWS = 2;      // rows per down CTA
 constexpr int DOWN_THREADS = 160;
 constexpr int UP_THREADS = 256;
+constexpr int UP_BLOCKS_PER_SM = 4;   // resident blocks an SM must hold: the grid then runs in one wave
 
 struct Hc8Gr {
     const float* R[MT];
@@ -238,7 +239,7 @@ __device__ void hc8_up(const Hc8Gr& p, int blk) {
         }
     }
 }
-__global__ void __launch_bounds__(UP_THREADS) hc8_up_kernel(Hc8Gr p) { hc8_up(p, blockIdx.x); }
+__global__ void __launch_bounds__(UP_THREADS, UP_BLOCKS_PER_SM) hc8_up_kernel(Hc8Gr p) { hc8_up(p, blockIdx.x); }
 
 }  // namespace
 
