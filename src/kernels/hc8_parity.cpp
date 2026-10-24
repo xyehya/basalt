@@ -4,7 +4,9 @@
 //   1. hc8_gr_read_multi (what fused_gr_read, fused_gr_read_multi and gr_read run for such matrices) against
 //      fused_gr_read_multi on the bf16 matrices (the error the copies add) and on the copies dequantized to bf16 (the
 //      kernels' own error), 1..8 tokens, with and without the pending write and the injection; every token's outputs
-//      bitwise the same whatever the token count and column; gr_read bitwise the one-token read.
+//      bitwise the same whatever the token count and column; gr_read bitwise the one-token read; the outputs of the
+//      read on the copies equal frozen hashes (the seeded inputs below, 1..8 tokens, with and without the pending write, and
+//      with the kernels launched to start early behind a preceding kernel).
 //   2. Gemm::bf16_w (the prompt path's product on a copy) against Gemm::bf16 on the bf16 matrix and against a
 //      double-precision product with the copy's exact values, on the prompt path's hc shapes, with a scratch that holds
 //      the whole matrix and with one that slices it (within fp32 rounding: cuBLAS's kernel can change with the width).
@@ -14,6 +16,7 @@
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/prefill/gemm.hpp"
 
 #include <cuda_runtime.h>
@@ -25,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -59,6 +63,15 @@ struct Err {
     void add(float a, float b) { abs = std::max(abs, (double) std::fabs(a - b)); ref = std::max(ref, (double) std::fabs(b)); }
     double rel() const { return ref > 0 ? abs / ref : abs; }
 };
+uint64_t fnv(uint64_t h, const void* p, size_t n) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+// FNV-1a of the read's outputs (lo, inject, mixed, R', rs) for the first T tokens of the seeded inputs; [pending write][T - 1]
+const uint64_t kFrozen[2][8] = {
+    {0xadc9b015165e77f1ull, 0x14262d26692ef4e8ull, 0xf9c2de37b5586a27ull, 0x43735aaebcd2212bull, 0x083daddd98a084d3ull, 0xaad6874670ce52feull, 0xdf41b428495bd3fbull, 0xbe6f037b0867ad88ull},
+    {0xe3992fc6bb71cba0ull, 0x13eb3011599bb439ull, 0x89bec5ed3f788a38ull, 0xa5c9b07c3c058204ull, 0x96a352050ebb9bb9ull, 0x46ee6d01afdd468eull, 0xde8997802da5fdd8ull, 0x599ef82af7adad90ull}};
 int g_fail = 0;
 void expect(bool ok, const char* what) {
     if (!ok) { std::printf("FAIL: %s\n", what); ++g_fail; }
@@ -125,8 +138,16 @@ int main(int argc, char** argv) {
     Out o[3];
     for (auto& x : o) alloc_out(x);
     // run `which` (0: hc8 copies, 1: bf16, 2: dequantized copies through the bf16 read) on tokens `tok` in columns 0..n-1
-    auto run = [&](int which, Out& out, const std::vector<int>& tok, bool apply, bool inject) {
+    cudaStream_t pst;
+    cudaStreamCreate(&pst);   // blocking: ordered after the default-stream copies
+    // `pdl`: the read's kernels may start early (a kernel precedes it on `pst`, then the read's first launch is a programmatic dependent)
+    auto run = [&](int which, Out& out, const std::vector<int>& tok, bool apply, bool inject, bool pdl = false) {
         cudaMemcpy(out.R, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
+        std::unique_ptr<K::PdlScope> scope;
+        if (pdl) {
+            K::hc8_dequant_bf16(vi, 0, HC, dqi, pst);
+            scope.reset(new K::PdlScope(true, false));
+        }
         K::FusedGrArgs a[K::kFusedGrMaxT];
         for (size_t c = 0; c < tok.size(); ++c) {
             const int t = tok[c];
@@ -141,7 +162,7 @@ int main(int argc, char** argv) {
             x.inject_out = out.io + (size_t) t * HC;
             x.mixed = out.mix + (size_t) t * N;
         }
-        K::fused_gr_read_multi(a, (int) tok.size(), out.xn, nullptr);
+        K::fused_gr_read_multi(a, (int) tok.size(), out.xn, pdl ? pst : nullptr);
         cudaDeviceSynchronize();
     };
     std::vector<int> all(TM);
@@ -189,6 +210,24 @@ int main(int argc, char** argv) {
             std::printf("  token count / column independence: %s\n", same ? "bitwise" : "DIFFERS");
             expect(same, "token count / column independence");
         }
+    {   // the outputs against the frozen hashes
+        bool all_ok = true;
+        for (int pdl = 0; pdl < 2; ++pdl)
+            for (int apply = 0; apply < 2; ++apply)
+                for (int T = 1; T <= TM; ++T) {
+                    run(0, o[0], std::vector<int>(all.begin(), all.begin() + T), apply, true, pdl != 0);
+                    uint64_t h = 14695981039346656037ull;
+                    const size_t cnt[5] = {(size_t) T * LR, (size_t) T * HC, (size_t) T * N, (size_t) T * D, (size_t) T * HC};
+                    const float* src[5] = {o[0].lo, o[0].io, o[0].mix, o[0].R, o[0].rs};
+                    for (int k = 0; k < 5; ++k) { const std::vector<float> v = get(src[k], cnt[k]); h = fnv(h, v.data(), v.size() * 4); }
+                    const bool ok = h == kFrozen[apply][T - 1];
+                    all_ok = all_ok && ok;
+                    std::printf("  frozen outputs, %d token%s, %s, %s: %016llx %s\n", T, T == 1 ? "" : "s",
+                                apply ? "pending write" : "no write", pdl ? "early start" : "plain launch", (unsigned long long) h,
+                                ok ? "ok" : "DIFFERS");
+                }
+        expect(all_ok, "the read's outputs against the frozen hashes");
+    }
     {   // gr_read on the copies: the one-token read
         const K::GrShapes gs{N, HC, LR};
         void* wsb = nullptr;
