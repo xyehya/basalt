@@ -85,7 +85,8 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
 }
 
 // DEC_MOE: combine's sum with each entry's row read from its tier (dec_moe.hpp), after the tiers this layer
-// uses have landed.  A VRAM row is +0.0 + row as the old path's hit add made it; the sum is combine's.
+// uses have landed.  A VRAM or PCIe-tier row (kind 0, 1: both in `parts`) is +0.0 + row as the old path's hit add made it;
+// the sum is combine's.
 namespace {
 __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* peer_rows, const float* cpu_rows,
                                   const DmPlan* __restrict__ plan, const float* __restrict__ weights,
@@ -106,7 +107,7 @@ __global__ void dm_combine_kernel(const float* __restrict__ parts, const float* 
     auto row = [&](int j) -> float {
         const int64_t off = (tk * k + j) * n_embd + col;
         const int kd = s_kind[j];
-        if (kd == 0) return __fadd_rn(0.0f, parts[off]);
+        if (kd == 0 || kd == 1) return __fadd_rn(0.0f, parts[off]);
         return __ldcv(kd == 2 ? peer_rows + off : cpu_rows + off);
     };
     float sum = row(0) * weights[0];
@@ -144,7 +145,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
         w[j] = weights[j];
-        if (s_kind[j] == 0) {
+        if (s_kind[j] == 0 || s_kind[j] == 1) {
             const float4 p = *reinterpret_cast<const float4*>(parts + (tk * k + j) * n_embd + col);
             v[j] = make_float4(__fadd_rn(0.0f, p.x), __fadd_rn(0.0f, p.y), __fadd_rn(0.0f, p.z), __fadd_rn(0.0f, p.w));
         } else if (TAG && s_kind[j] == 2) {
@@ -158,7 +159,7 @@ __global__ void dm_combine4_kernel(const float* __restrict__ parts, const float*
     for (int j = 0; j < KM; ++j) {
         if (j >= k) break;
         const int kd = s_kind[j];
-        if (kd != 0 && !(TAG && kd == 2)) v[j] = __ldcv(mapped_row(j, kd));
+        if (kd != 0 && kd != 1 && !(TAG && kd == 2)) v[j] = __ldcv(mapped_row(j, kd));
     }
     if constexpr (TAG) {
         // a peer row still holding the tag word is read again until none is; a released window (tag_done past ring)

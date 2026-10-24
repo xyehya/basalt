@@ -18,6 +18,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/native_moe.hpp"
 #include "basalt/kernels/s2_expert_grouped.hpp"
+#include "basalt/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -493,6 +494,273 @@ void stress(const basalt::GgufFile* gguf, int l, int gt, int dt, int windows, bo
 }
 
 }  // namespace
+
+
+// The PCIe tier (kind 1).  `blobs` holds NX experts (real or synthetic); expert id e uses blob e % NX.  Experts 0-15 are on
+// CUDA0, 56-63 on a peer, 16-39 can be read by the GPU from the mapped arena (the PCIe tier's candidates), 40-55 cannot (a
+// miss the CPU keeps).  Per window width, share and id pattern:
+//   plan   the route's kinds, counts, ring header and PCIe groups equal a host model of the selection rule
+//   rows   the PCIe groups, staged by fetch_blobs / rebase_ptrs and run by native_expert_grouped, equal bitwise the same
+//          experts run one entry to a group on VRAM copies (the VRAM tier's arithmetic, a different grouping)
+//   tail   dec_moe_combine over kinds 0 / 1 (parts), 2 (peer rows), -1 (CPU rows) equals native_moe_combine_multi over the
+//          old chain's rows
+void pcie_tier_test(int l, const K::NativeExpertLayout& L, const std::vector<uint8_t>& blobs, int NX, bool bench) {
+    std::mt19937 rng(777 + l);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    cudaStream_t s0;
+    ck(cudaSetDevice(0), "dev0");
+    ck(cudaStreamCreateWithFlags(&s0, cudaStreamNonBlocking), "stream");
+    uint8_t* h_arena = hmap<uint8_t>(blobs.size());
+    std::memcpy(h_arena, blobs.data(), blobs.size());
+    uint8_t* d_alias = nullptr;
+    ck(cudaHostGetDevicePointer((void**) &d_alias, h_arena, 0), "alias");
+    uint8_t* d_blob = dmal<uint8_t>(blobs.size());
+    ck(cudaMemcpy(d_blob, blobs.data(), blobs.size(), cudaMemcpyHostToDevice), "blobs");
+    uint8_t* d_stage = dmal<uint8_t>((size_t) K::kDmPcieMax * L.bytes);
+    std::vector<int32_t> res0(NE, -1), res1(NE, -1);
+    std::vector<unsigned long long> tab(NE, 0ull);
+    for (int e = 0; e < 16; ++e) res0[e] = e % NX;
+    for (int e = 56; e < 64; ++e) res1[e] = e % NX;
+    for (int e = 16; e < 40; ++e) tab[e] = (unsigned long long) (d_alias + (size_t) (e % NX) * L.bytes);
+    int32_t *d_res0 = dmal<int32_t>(NE), *d_res1 = dmal<int32_t>(NE);
+    unsigned long long* d_tab = dmal<unsigned long long>(NE);
+    ck(cudaMemcpy(d_res0, res0.data(), NE * 4, cudaMemcpyHostToDevice), "res");
+    ck(cudaMemcpy(d_res1, res1.data(), NE * 4, cudaMemcpyHostToDevice), "res");
+    ck(cudaMemcpy(d_tab, tab.data(), NE * 8, cudaMemcpyHostToDevice), "tab");
+    std::vector<float> x((size_t) MT * H);
+    for (auto& v : x) v = nd(rng);
+    float* d_x = dmal<float>(x.size());
+    ck(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+    const size_t xq_bytes = (size_t) MT * H / 32 * 36;
+    void* d_xq = dmal<uint8_t>(xq_bytes);
+    void* d_xq2 = dmal<uint8_t>(xq_bytes);
+    K::quantize_q8_1_rows(d_x, MT, H, d_xq, nullptr);
+    ck(cudaDeviceSynchronize(), "q8_1");
+    K::DmPlan* d_plan = dmal<K::DmPlan>(1);
+    int32_t* d_ids = dmal<int32_t>(K::kDmCap);
+    float *d_w = dmal<float>(K::kDmCap), *d_sh = dmal<float>((size_t) MT * H), *d_bo = dmal<float>((size_t) MT * H),
+          *d_bo2 = dmal<float>((size_t) MT * H), *d_parts = dmal<float>((size_t) K::kDmCap * H),
+          *d_ref = dmal<float>((size_t) K::kDmCap * H), *d_parts2 = dmal<float>((size_t) K::kDmCap * H);
+    void* d_scr = dmal<uint8_t>(K::native_expert_scratch_bytes(K::kDmCap, FF));
+    unsigned int* d_ctr = dmal<unsigned int>(4);
+    K::DmRing* h_ring = hmap<K::DmRing>(1);
+    float* h_x = hmap<float>((size_t) MT * H);
+    uint8_t* h_xq = hmap<uint8_t>(xq_bytes);
+    uint32_t* h_words = hmap<uint32_t>(64);
+    float* h_cpu = hmap<float>((size_t) K::kDmCap * H);
+    float* h_peer = hmap<float>((size_t) K::kDmCap * H);
+    int checked = 0;
+    for (int pattern = 0; pattern < 2; ++pattern)   // 1: repeated ids within a token, an invalid id, an id past the table
+        for (int T : {1, 2, 3, 5, 8})
+            for (int num : {0, 38, 64, 90, 256}) {
+                const int n = T * (int) KK;
+                std::vector<int32_t> ids(n);
+                for (int t = 0; t < T; ++t) {
+                    std::vector<int> pick;
+                    while ((int) pick.size() < KK) {
+                        const int e = (int) (rng() % 64);
+                        if (std::find(pick.begin(), pick.end(), e) == pick.end()) pick.push_back(e);
+                    }
+                    for (int j = 0; j < KK; ++j) ids[t * KK + j] = pick[j];
+                }
+                if (pattern == 1) {
+                    ids[1] = ids[0];                     // a repeat within token 0
+                    ids[(T - 1) * KK + 4] = -1;          // invalid
+                    ids[(T - 1) * KK + 6] = (int) NE + 3;   // past the table
+                    if (T > 1) ids[KK + 2] = ids[2];     // an id shared by two tokens (not a repeat within one)
+                }
+                // host model
+                std::vector<int32_t> kind(n, -1);
+                std::vector<char> cand(n, 0);
+                for (int i = 0; i < n; ++i) {
+                    const int e = ids[i];
+                    bool ok = e >= 0 && e < NE;
+                    for (int j = i - i % (int) KK; ok && j < i; ++j) ok = ids[j] != e;
+                    if (!ok) continue;
+                    kind[i] = res0[e] >= 0 ? 0 : res1[e] >= 0 ? 2 : -1;
+                    cand[i] = num > 0 && kind[i] < 0 && tab[e] != 0;
+                }
+                std::vector<int> gfirst;   // entry index of each candidate group's first entry
+                for (int i = 0; i < n; ++i) {
+                    bool seen = false;
+                    for (int g : gfirst) seen |= cand[i] && ids[g] == ids[i];
+                    if (cand[i] && !seen) gfirst.push_back(i);
+                }
+                const int ng = (int) gfirst.size(), m = std::min(std::min((ng * num) >> 8, K::kDmPcieMax), ng);
+                std::vector<int32_t> p_start{0}, p_dst, p_tok;
+                std::vector<unsigned long long> p_ptr;
+                for (int g = ng - m; g < ng; ++g) {
+                    p_ptr.push_back(tab[ids[gfirst[g]]]);
+                    for (int i = 0; i < n; ++i)
+                        if (cand[i] && ids[i] == ids[gfirst[g]]) { kind[i] = 1; p_dst.push_back(i); p_tok.push_back(i / (int) KK); }
+                    p_start.push_back((int) p_dst.size());
+                }
+                int nc = 0, np = 0;
+                for (int i = 0; i < n; ++i) { nc += kind[i] < 0; np += kind[i] == 2; }
+
+                ck(cudaMemcpy(d_ids, ids.data(), n * 4, cudaMemcpyHostToDevice), "ids");
+                std::memset(h_words, 0, 256);
+                *h_ring = K::DmRing();
+                ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
+                K::DmRouteArgs ra;
+                ra.ids = d_ids; ra.x = d_x; ra.n_tok = T; ra.k = (int) KK; ra.n_embd = (int) H; ra.n_expert = (int) NE;
+                ra.layer = l; ra.res0 = d_res0; ra.res1 = d_res1; ra.cache_base = d_blob; ra.blob = (long long) L.bytes;
+                ra.plan = d_plan; ra.xq = d_xq2; ra.ring_m = h_ring; ra.x_m = h_x; ra.xq_m = h_xq; ra.host_seq_m = h_words;
+                ra.peer_seq_m = h_words + 16; ra.ring = 1; ra.ctr = d_ctr;
+                if (num > 0 || pattern == 1) { ra.pcie_tab = d_tab; ra.pcie_num = num; }   // off: null table; num 0: table, no share
+                K::dec_moe_route(ra, s0);
+                ck(cudaStreamSynchronize(s0), "route");
+                K::DmPlan P;
+                ck(cudaMemcpy(&P, d_plan, sizeof P, cudaMemcpyDeviceToHost), "plan");
+                size_t bad = 0;
+                for (int i = 0; i < n; ++i) bad += P.kind[i] != kind[i] || h_ring->kind[i] != kind[i];
+                bad += P.counts[2] != np || P.counts[3] != nc || h_ring->n_peer != np || h_ring->n_cpu != nc;
+                if (num > 0) {
+                    bad += P.pcie[0] != m || P.pcie[1] != (int) p_dst.size() || h_ring->n_pcie != m;
+                    for (int g = 0; g < m; ++g) bad += P.ptr2[g] != p_ptr[g] || P.start2[g] != p_start[g];
+                    bad += P.start2[m] != (int) p_dst.size();
+                    for (size_t e = 0; e < p_dst.size(); ++e) bad += P.dst2[e] != p_dst[e] || P.tok2[e] != p_tok[e];
+                } else {
+                    bad += h_ring->n_pcie != 0;
+                }
+                char what[96];
+                std::snprintf(what, sizeof what, "pcie plan T=%d share %d/256 (%d groups, %d cpu)%s", T, num, m, nc,
+                              pattern ? " odd ids" : "");
+                report(what, l, bad, (size_t) n);
+                if (num == 0 && pattern == 0) continue;
+                if (m == 0 && nc == 0 && np == 0) continue;
+
+                // rows: the VRAM-tier reference, one entry to a group, on the VRAM copies of every entry that has a row
+                Groups G;
+                std::vector<int> rows, pc_rows;
+                for (int i = 0; i < n; ++i) {
+                    if (kind[i] != 0 && kind[i] != 1) continue;
+                    G.ptr.push_back((unsigned long long) (d_blob + (size_t) (ids[i] % NX) * L.bytes));
+                    G.start.push_back((int) G.dst.size());
+                    G.dst.push_back(i);
+                    G.tok.push_back(i / (int) KK);
+                    rows.push_back(i);
+                    if (kind[i] == 1) pc_rows.push_back(i);
+                }
+                G.start.push_back((int) G.dst.size());
+                G.upload();
+                ck(cudaDeviceSynchronize(), "groups");
+                ck(cudaMemsetAsync(d_ref, 0xff, (size_t) K::kDmCap * H * 4, s0), "memset");
+                ck(cudaMemsetAsync(d_parts, 0xff, (size_t) K::kDmCap * H * 4, s0), "memset");
+                ck(cudaMemsetAsync(d_parts2, 0xff, (size_t) K::kDmCap * H * 4, s0), "memset");
+                K::native_expert_grouped(L, G.d_ptr, G.d_start, G.d_n, G.d_dst, G.d_tok, K::kDmCap, K::kDmCap, d_xq2, d_scr, d_ref, s0);
+                // the engine's launches: the VRAM plan's groups, then the PCIe stage
+                K::native_expert_grouped(L, d_plan->ptr, d_plan->start, d_plan->counts, d_plan->dst, d_plan->tok, n, n, d_xq2,
+                                         d_scr, d_parts, s0);
+                if (num > 0) {   // off, the engine records none of these
+                    K::fetch_blobs(d_plan->ptr2, d_plan->pcie, d_stage, (int64_t) L.bytes, K::kDmPcieMax, s0);
+                    K::rebase_ptrs(d_plan->ptr2, d_plan->pcie, d_stage, (int64_t) L.bytes, s0);
+                    K::native_expert_grouped(L, d_plan->ptr2, d_plan->start2, d_plan->pcie, d_plan->dst2, d_plan->tok2, n,
+                                             n, d_xq2, d_scr, d_parts, s0, 4);
+                }
+                ck(cudaStreamSynchronize(s0), "tier");
+                const auto ref = down(d_ref, (size_t) n * H), got = down(d_parts, (size_t) n * H);
+                std::snprintf(what, sizeof what, "pcie rows T=%d share %d/256 (%zu rows from the arena)%s", T, num,
+                              pc_rows.size(), pattern ? " odd ids" : "");
+                report(what, l, ndiff_rows(ref, got, rows), rows.size() * H);
+                // tail: the old chain's rows (kind 0 / 1 from the reference, 2 the peer's, -1 the CPU's) through the old combine
+                std::vector<float> w(n), sh((size_t) T * H);
+                for (auto& v : w) v = std::fabs(nd(rng)) * 0.1f;
+                for (auto& v : sh) v = nd(rng);
+                ck(cudaMemcpy(d_w, w.data(), n * 4, cudaMemcpyHostToDevice), "w");
+                ck(cudaMemcpy(d_sh, sh.data(), sh.size() * 4, cudaMemcpyHostToDevice), "sh");
+                std::vector<float> chain = ref;
+                for (int i = 0; i < n; ++i) {
+                    float* dst = chain.data() + (size_t) i * H;
+                    for (int64_t c = 0; c < H; ++c) {
+                        const float v = nd(rng);
+                        if (kind[i] == 2) h_peer[(size_t) i * H + c] = v;
+                        if (kind[i] < 0) h_cpu[(size_t) i * H + c] = v;
+                        if (kind[i] < 0 || kind[i] == 2) dst[c] = v;
+                    }
+                }
+                ck(cudaMemcpy(d_parts2, chain.data(), chain.size() * 4, cudaMemcpyHostToDevice), "chain");
+                ck(cudaDeviceSynchronize(), "chain");
+                K::native_moe_combine_multi(d_parts2, d_w, d_sh, d_bo2, H, KK, T, s0);
+                K::dec_moe_combine(d_parts, h_peer, h_cpu, d_plan, d_w, d_sh, d_bo, H, KK, T, nullptr, nullptr, 1, s0);
+                ck(cudaStreamSynchronize(s0), "combine");
+                const auto o1 = down(d_bo, (size_t) T * H), o2 = down(d_bo2, (size_t) T * H);
+                size_t cd = 0;
+                for (size_t i = 0; i < o1.size(); ++i) cd += std::memcmp(&o1[i], &o2[i], 4) != 0;
+                std::snprintf(what, sizeof what, "pcie tail T=%d share %d/256%s", T, num, pattern ? " odd ids" : "");
+                report(what, l, cd, o1.size());
+                ++checked;
+            }
+    std::printf("  pcie tier layer %d: %d windows with rows checked\n", l, checked);
+    if (!bench) return;
+    {   // the route kernel without the tier, with it taking nothing (share 1/256), and at share 64/256: what the selection step adds
+        const int T = 5, n = T * (int) KK;
+        std::vector<int32_t> ids(n);
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < KK; ++j) ids[t * KK + j] = (t * 7 + j * 13) % 64;
+        ck(cudaMemcpy(d_ids, ids.data(), n * 4, cudaMemcpyHostToDevice), "ids");
+        ck(cudaDeviceSynchronize(), "ids");
+        K::DmRouteArgs ra;
+        ra.ids = d_ids; ra.x = d_x; ra.n_tok = T; ra.k = (int) KK; ra.n_embd = (int) H; ra.n_expert = (int) NE;
+        ra.layer = l; ra.res0 = d_res0; ra.res1 = d_res1; ra.cache_base = d_blob; ra.blob = (long long) L.bytes;
+        ra.plan = d_plan; ra.xq = d_xq2; ra.ring_m = h_ring; ra.x_m = h_x; ra.xq_m = h_xq; ra.host_seq_m = h_words;
+        ra.peer_seq_m = h_words + 16; ra.ring = 1; ra.ctr = d_ctr;
+        double t[3];
+        int i = 0;
+        for (int num : {0, 1, 64}) {
+            K::DmRouteArgs rb = ra;
+            if (num > 0) { rb.pcie_tab = d_tab; rb.pcie_num = num; }
+            t[i++] = time_us(s0, 400, [&] { K::dec_moe_route(rb, s0); });
+        }
+        std::printf("  bench: route T=5: no tier %.2f us | tier on, share 1/256 (takes nothing) %.2f us | share 64/256 %.2f us\n", t[0], t[1], t[2]);
+    }
+    // microbench: m groups (one entry each) fetched from the arena, rebased and computed, against the same groups in VRAM;
+    // the sets rotate over the arena so the L2 holds none of them
+    for (int m : {1, 2, 4, 6, 8, 12, 16}) {
+        constexpr int SETS = 6;
+        std::vector<unsigned long long*> d_set(SETS);
+        std::vector<unsigned long long> vram_set;
+        for (int st = 0; st < SETS; ++st) {
+            std::vector<unsigned long long> p;
+            for (int g = 0; g < m; ++g) p.push_back((unsigned long long) (d_alias + (size_t) ((st * 7 + g) % NX) * L.bytes));
+            d_set[st] = dmal<unsigned long long>(K::kDmCap);
+            ck(cudaMemcpy(d_set[st], p.data(), p.size() * 8, cudaMemcpyHostToDevice), "set");
+        }
+        unsigned long long* d_work = dmal<unsigned long long>(K::kDmCap);
+        std::vector<int32_t> st(m + 1), ds(m), tk(m);
+        for (int g = 0; g <= m; ++g) st[g] = g;
+        for (int g = 0; g < m; ++g) { ds[g] = g; tk[g] = g % MT; }
+        int32_t *d_st = dmal<int32_t>(K::kDmCap + 1), *d_ds = dmal<int32_t>(K::kDmCap), *d_tk = dmal<int32_t>(K::kDmCap),
+                *d_n = dmal<int32_t>(4);
+        ck(cudaMemcpy(d_st, st.data(), st.size() * 4, cudaMemcpyHostToDevice), "st");
+        ck(cudaMemcpy(d_ds, ds.data(), m * 4, cudaMemcpyHostToDevice), "ds");
+        ck(cudaMemcpy(d_tk, tk.data(), m * 4, cudaMemcpyHostToDevice), "tk");
+        ck(cudaMemcpy(d_n, &m, 4, cudaMemcpyHostToDevice), "n");
+        int rot = 0;
+        auto reset = [&] { ck(cudaMemcpyAsync(d_work, d_set[rot++ % SETS], (size_t) m * 8, cudaMemcpyDeviceToDevice, s0), "work"); };
+        const double t_reset = time_us(s0, 100, reset);
+        const double t_fetch = time_us(s0, 100, [&] {
+            reset();
+            K::fetch_blobs(d_work, d_n, d_stage, (int64_t) L.bytes, K::kDmPcieMax, s0);
+        }) - t_reset;
+        const double t_all = time_us(s0, 100, [&] {
+            reset();
+            K::fetch_blobs(d_work, d_n, d_stage, (int64_t) L.bytes, K::kDmPcieMax, s0);
+            K::rebase_ptrs(d_work, d_n, d_stage, (int64_t) L.bytes, s0);
+            K::native_expert_grouped(L, d_work, d_st, d_n, d_ds, d_tk, K::kDmCap, K::kDmCap, d_xq, d_scr, d_parts, s0, 4);
+        }) - t_reset;
+        // the same groups on VRAM copies (past the L2: blobs rotate through the 48 copies)
+        std::vector<unsigned long long> v;
+        for (int g = 0; g < m; ++g) v.push_back((unsigned long long) (d_blob + (size_t) ((g * 5) % NX) * L.bytes));
+        ck(cudaMemcpy(d_work, v.data(), v.size() * 8, cudaMemcpyHostToDevice), "v");
+        const double t_vram = time_us(s0, 100, [&] {
+            K::native_expert_grouped(L, d_work, d_st, d_n, d_ds, d_tk, K::kDmCap, K::kDmCap, d_xq, d_scr, d_parts, s0, 4);
+        });
+        const double mb = m * (double) L.bytes / 1e3;
+        std::printf("  bench: PCIe stage %2d groups (%.1f MB): fetch %.1f us (%.0f GB/s) | fetch+rebase+grouped %.1f us (%.0f GB/s) "
+                    "| the same groups in VRAM %.1f us\n", m, mb / 1e3, t_fetch, mb / t_fetch, t_all, mb / t_all, t_vram);
+    }
+}
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -981,6 +1249,8 @@ int main(int argc, char** argv) {
                 cudaFree(big);
             }
         }
+
+        pcie_tier_test(l, L, blobs, NX, bench);
 
         // ---- the window on two cards
         if (two) {

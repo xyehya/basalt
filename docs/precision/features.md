@@ -168,6 +168,18 @@ against the base.
   for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 76-86). In the quality gate about 0.8% of
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the
   same for spec 0 and spec 7.
+- The PCIe tier of the decode window is opt-in (`--exp dm_pcie=F`, F the share of the distinct misses; `--exp dm_pcie_check=1` / `=2`
+  verifies its address table / the bytes behind it while decoding). It moves a share of the CPU pool's entries to the GPU's
+  arithmetic. It is off by default because it does not pay with the faster CPU pool: server decode, 1K to 160K context, temperature 0.7,
+  two runs per arm, geometric mean of tok/s (RTX 5080, PCIe 5.0 x16, Core Ultra 9 285K): the stack with the pool changes and share 0
+  165.2 (+14.7% on the previous build's 144.0), share 0.25 164.7 (-0.3% against share 0), share 0.35 157.3 (-4.8%); with the previous
+  pool the tier took 4 to 5% off the window (a window-time gate, 76% VRAM hits), so the two are substitutes and the faster pool leaves
+  the GPU's PCIe stage as the later side. Quality gate
+  (IQ3_S, 20 chunks of wikitext-2 against the llama.cpp IQ3_S base, T 3, tiers pinned, 300 MiB reserve, 360 W): reference
+  PPL 2.3921, KLD 0.02145, top-1 96.31%; share 0.15: 2.3879, 0.02269, 96.25%; 0.25: 2.3920, 0.02112, 96.33%; 0.35: 2.3977,
+  0.02155, 96.25% (12.6% of the routed experts on the tier at 0.25, 18.3% at 0.35). The reference with other tier sizes (2,500
+  and 3,500 expert slots, which moves a comparable share between the CPU and the GPU) gives PPL 2.3882 / 2.3881, KLD 0.02237 /
+  0.02273, top-1 95.96% / 96.45%: the shares sit inside that spread. Rows differ almost everywhere (a rounding difference).
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
 
 ## Relaxed drafting

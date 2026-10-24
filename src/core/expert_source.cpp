@@ -1703,7 +1703,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // the device planned the layer; only its CPU entries are the pool's
     const bool ext = d.plan != nullptr && d.plan->ext_kind != nullptr && n <= kMaxWindowEntries;
     if (ext) {
-        for (int64_t i = 0; i < n; ++i) kind[i] = d.plan->ext_kind[i];
+        int64_t pcie_at[kMaxWindowEntries];
+        int np = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            kind[i] = d.plan->ext_kind[i];
+            if (kind[i] == 1) pcie_at[np++] = i;
+        }
+        for (int q = 0; q < np; ++q) {   // the distinct experts the GPU reads over PCIe
+            int r = 0;
+            while (r < q && ids[pcie_at[r]] != ids[pcie_at[q]]) ++r;
+            if (r == q) ++d.pcie_experts;
+        }
     } else if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;

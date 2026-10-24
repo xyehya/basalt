@@ -8,7 +8,9 @@
 // layer has entries there; the combine reads every row from where its tier left it.
 //
 // Every row is computed by the same arithmetic as the grouped kernels it replaces (native_expert_grouped), so a
-// tier gives the same bits as before; only the PCIe share is gone (those entries go to the CPU pool).
+// tier gives the same bits as before.  The PCIe tier (kind 1) takes a share of the entries that would go to the CPU pool:
+// CUDA0 stages those experts from the mapped host arena with the copy kernel and runs the grouped kernels on the staged
+// copies, into the same rows of `parts` as its VRAM tier; with no share, those entries go to the CPU pool.
 #pragma once
 
 #include "basalt/kernels/iq_kernels.hpp"
@@ -23,19 +25,26 @@ constexpr int kDmCap = 128;          ///< entries per window: kVerifyMaxT tokens
 
 /// One ring (layer) as the route kernel publishes it to mapped memory.
 struct DmRing {
-    int32_t n_tok = 0, layer = 0, n_vram = 0, n_peer = 0, n_cpu = 0, pad[3] = {};
+    int32_t n_tok = 0, layer = 0, n_vram = 0, n_peer = 0, n_cpu = 0, n_pcie = 0, pad[2] = {};   ///< n_pcie: PCIe groups
     int32_t ids[kDmCap] = {};
-    int32_t kind[kDmCap] = {};       ///< 0: CUDA0's VRAM tier, 2: the peer card, -1: the CPU pool
+    int32_t kind[kDmCap] = {};       ///< 0: CUDA0's VRAM tier, 1: CUDA0 reading the mapped arena, 2: the peer card, -1: the CPU pool
 };
 
 /// CUDA0's grouped plan (native_expert_grouped's lists) and every entry's tier, on the device.
 struct DmPlan {
     int32_t counts[4];               ///< [0] VRAM groups, [1] VRAM entries, [2] peer entries, [3] CPU entries
+    int32_t pcie[4];                 ///< [0] PCIe groups, [1] PCIe entries
     int32_t start[kDmCap + 1];
     int32_t dst[kDmCap];
     int32_t tok[kDmCap];
     int32_t kind[kDmCap];
     unsigned long long ptr[kDmCap];
+    /// The PCIe tier's groups (kind 1), numbered from 0: group g's blob (its address in the mapped arena, then in staging)
+    /// at ptr2[g], entries [start2[g], start2[g + 1]) read token tok2[e] and write row dst2[e].
+    unsigned long long ptr2[kDmCap];
+    int32_t start2[kDmCap + 1];
+    int32_t dst2[kDmCap];
+    int32_t tok2[kDmCap];
 };
 
 struct DmRouteArgs {
@@ -67,7 +76,14 @@ struct DmRouteArgs {
     unsigned long long* stats = nullptr;   ///< DM_WAIT_STATS (kDmStatWords, device) or null: the doorbell's time
     int peer_cap = 0;                ///< PEER_CAP: the peer's groups past this many go to the CPU pool (0: no cap)
     bool kinds = false;              ///< mode 2: also every entry's tier into plan->kind and counts[2], counts[3]
+    /// The PCIe tier: this layer's mapped-arena blob address per expert (0: not readable by the GPU), or null (off), and the
+    /// share of the distinct CPU-bound experts, in 256ths, it takes (the last ones in routing order).  Where the plan is
+    /// written (modes 0 and 1, or `kinds`) it also gets the PCIe groups.
+    const unsigned long long* pcie_tab = nullptr;
+    int pcie_num = 0;
 };
+/// Most PCIe groups a layer takes (the staging buffers' blobs).
+constexpr int kDmPcieMax = 16;
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
 void dec_moe_route(const DmRouteArgs& a, void* stream);

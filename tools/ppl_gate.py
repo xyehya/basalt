@@ -73,9 +73,18 @@ def diff(pa: str, pb: str) -> str:
     dn = max(abs(float(a[k][3]) - float(b[k][3])) for k in keys)
     dk = max(abs(float(a[k][5]) - float(b[k][5])) for k in keys)
     first = next((k for k in keys if a[k][3:] != b[k][3:]), None)
+
+    def paired(col: int):
+        d = [float(b[k][col]) - float(a[k][col]) for k in keys]
+        m = sum(d) / len(d)
+        return m, math.sqrt(max(0.0, sum(v * v for v in d) / len(d) - m * m) / max(1, len(d) - 1))
+    mn, sn = paired(3)
+    mk, sk = paired(5)
     return (f"rows {len(keys)}: identical {same} ({100.0 * same / len(keys):.2f}%), same top-1 {top}, "
             f"max |dNLL| {dn:.6f}, max |dKLD| {dk:.6f}, first difference "
-            f"{'none' if first is None else 'chunk %s pos %s' % first}")
+            f"{'none' if first is None else 'chunk %s pos %s' % first}\n"
+            f"paired B - A: mean dNLL {mn:+.5f} +/- {sn:.5f} (dPPL {math.exp(sum(float(a[k][3]) for k in keys) / len(keys) + mn) - math.exp(sum(float(a[k][3]) for k in keys) / len(keys)):+.4f}), "
+            f"mean dKLD {mk:+.5f} +/- {sk:.5f}")
 
 
 def gpu_count() -> int:
