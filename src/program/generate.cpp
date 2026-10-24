@@ -9628,7 +9628,7 @@ int main(int argc, char** argv) {
         if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
-                        drive.d.pcie_num);
+                        o.dm_pcie_frac > 0.0 ? (int) (o.dm_pcie_frac * 256.0 + 0.5) : drive.d.pcie_num);
         (void) pool_ms0;
         if (use_mtp && rounds > 0)
             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",
