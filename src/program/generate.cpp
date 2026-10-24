@@ -1205,8 +1205,9 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
-// The device-planned window's PCIe share for a link measured at `gbps` (--exp dm_pcie=F overrides it).
-constexpr double kDmPcieBase = 0.0;
+// The device-planned window's PCIe share for a link measured at `gbps`, scaled like the host-planned one (--exp dm_pcie=F overrides
+// it; 0 turns the tier off).
+constexpr double kDmPcieBase = 0.35;
 
 }  // namespace
 

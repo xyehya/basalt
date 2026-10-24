@@ -168,7 +168,8 @@ against the base.
   for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 76-86). In the quality gate about 0.8% of
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the
   same for spec 0 and spec 7.
-- The PCIe tier of the decode window moves a further share of the CPU pool's entries to the GPU's arithmetic. Quality gate
+- The PCIe tier of the decode window (on by default at a share of 0.35 of the distinct misses on a x16 link, less on a slower
+  one; `--exp dm_pcie=0` turns it off) moves a further share of the CPU pool's entries to the GPU's arithmetic. Quality gate
   (IQ3_S, 20 chunks of wikitext-2 against the llama.cpp IQ3_S base, T 3, tiers pinned, 300 MiB reserve, 360 W): reference
   PPL 2.3921, KLD 0.02145, top-1 96.31%; share 0.15: 2.3879, 0.02269, 96.25%; 0.25: 2.3920, 0.02112, 96.33%; 0.35: 2.3977,
   0.02155, 96.25% (12.6% of the routed experts on the tier at 0.25, 18.3% at 0.35). The reference with other tier sizes (2,500
