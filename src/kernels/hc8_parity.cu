@@ -8,7 +8,9 @@
 //   1b. The read on the copies against frozen hashes of its outputs (taken from the kernels before the early-start
 //      change), for several geometries (the model's, no injection, other widths and stream counts), 1..8 tokens, with
 //      and without the pending write, launched plain and as a programmatic dependent behind a kernel; inputs come from
-//      raw mt19937 words (integers times powers of two), so the hashes do not depend on the C++ library.
+//      raw mt19937 words (integers times powers of two), so the hashes do not depend on the C++ library. And the
+//      dependency itself: a producer kernel triggers its dependents at once, spins, then writes the read's inputs; the
+//      read started early behind it must still give the frozen hashes (a read before pdl_wait would see zeros).
 //   2. Gemm::bf16_w (the prompt path's product on a copy) against Gemm::bf16 on the bf16 matrix and against a
 //      double-precision product with the copy's exact values, on the prompt path's hc shapes, with a scratch that holds
 //      the whole matrix and with one that slices it (within fp32 rounding: cuBLAS's kernel can change with the width).
@@ -111,6 +113,18 @@ const uint64_t kFrozen[kCases][2][8] = {
       0xfa369d17cf3edc9aull, 0xe9eab46a088e8932ull, 0xdd5823e831bb9088ull, 0xf70f09f053410681ull}}};
 constexpr int kTok = 8;
 
+// stands in for the kernel before the read: lets its dependents start at once, spins, then writes the read's inputs
+__global__ void producer(float* R, const float* R0, size_t nR, float* bo, const float* bo0, size_t nb, float* inj, const float* inj0,
+                         size_t ni, long long spin) {
+    K::pdl_launch_dependents();
+    const long long t0 = clock64();
+    while (clock64() - t0 < spin) {}
+    const size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x, st = (size_t) gridDim.x * blockDim.x;
+    for (size_t i = tid; i < nR; i += st) R[i] = R0[i];
+    for (size_t i = tid; i < nb; i += st) bo[i] = bo0[i];
+    for (size_t i = tid; i < ni; i += st) inj[i] = inj0[i];
+}
+
 template <typename V>
 V* upload(const std::vector<V>& h) {
     V* d;
@@ -150,17 +164,23 @@ struct Rig {
         cudaMalloc((void**) &dqi, (size_t) c.HC * D * 2);
         cudaStreamCreate(&pst);   // blocking: ordered after the default-stream copies
     }
-    // mode 0: plain launch; 1: behind a kernel that does not touch the read's data, started early as a programmatic dependent
+    // mode 0: plain launch; 1: behind a kernel that does not touch the read's data; 2: behind a producer that writes the
+    // inputs after letting its dependents start; 3: the producer, plain launch (stream order only)
     uint64_t read(int T, bool apply, int mode) {
         const size_t nb = (size_t) kTok * c.N, ni = (size_t) kTok * c.HC;
-        cudaMemcpy(dR, R0, R.size() * 4, cudaMemcpyDeviceToDevice); cudaMemcpy(dbo, bo0, nb * 4, cudaMemcpyDeviceToDevice);
-        cudaMemcpy(dinj, inj0, ni * 4, cudaMemcpyDeviceToDevice);
+        if (mode >= 2) {
+            cudaMemset(dR, 0, R.size() * 4); cudaMemset(dbo, 0, nb * 4); cudaMemset(dinj, 0, ni * 4);
+        } else {
+            cudaMemcpy(dR, R0, R.size() * 4, cudaMemcpyDeviceToDevice); cudaMemcpy(dbo, bo0, nb * 4, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(dinj, inj0, ni * 4, cudaMemcpyDeviceToDevice);
+        }
         cudaMemset(lo, 0xff, (size_t) kTok * c.LR * 4); cudaMemset(rs, 0xff, (size_t) kTok * c.HC * 4);
         cudaMemset(io, 0xff, ni * 4); cudaMemset(mix, 0xff, nb * 4);
         cudaDeviceSynchronize();
         std::unique_ptr<K::PdlScope> scope;
+        if (mode >= 2) producer<<<64, 256, 0, pst>>>(dR, R0, R.size(), dbo, bo0, nb, dinj, inj0, ni, 200000);
         if (mode == 1) K::hc8_dequant_bf16(vi, 0, c.HC, dqi, pst);
-        if (mode == 1) scope.reset(new K::PdlScope(true, false));
+        if (mode == 1 || mode == 2) scope.reset(new K::PdlScope(true, false));
         K::FusedGrArgs a[K::kFusedGrMaxT];
         for (int t = 0; t < T; ++t) {
             K::FusedGrArgs& x = a[t];
@@ -186,15 +206,17 @@ struct Rig {
 };
 
 void frozen_checks() {
-    static const char* const kMode[2] = {"plain launch", "early start behind a kernel"};
+    static const char* const kMode[4] = {"plain launch", "early start behind a kernel", "early start behind a producer",
+                                         "producer, plain launch"};
     for (int idx = 0; idx < kCases; ++idx) {
         Rig rig(idx);
         const Case& c = rig.c;
         int bad = 0, n = 0;
-        for (int mode = 0; mode < 2; ++mode)
+        for (int mode = 0; mode < 4; ++mode)
             for (int apply = 0; apply < 2; ++apply)
                 for (int T = 1; T <= kTok; ++T)
-                    {
+                    for (int rep = 0; rep < (mode >= 2 && idx == 0 ? 3 : 1); ++rep) {
+                        if (mode >= 2 && idx > 1) continue;
                         const uint64_t h = rig.read(T, apply != 0, mode);
                         const bool ok = h == kFrozen[idx][apply][T - 1];
                         ++n; bad += !ok;
