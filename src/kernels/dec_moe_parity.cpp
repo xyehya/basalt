@@ -693,6 +693,27 @@ void pcie_tier_test(int l, const K::NativeExpertLayout& L, const std::vector<uin
             }
     std::printf("  pcie tier layer %d: %d windows with rows checked\n", l, checked);
     if (!bench) return;
+    {   // the route kernel without the tier, with it taking nothing (share 1/256), and at share 64/256: what the selection step adds
+        const int T = 5, n = T * (int) KK;
+        std::vector<int32_t> ids(n);
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < KK; ++j) ids[t * KK + j] = (t * 7 + j * 13) % 64;
+        ck(cudaMemcpy(d_ids, ids.data(), n * 4, cudaMemcpyHostToDevice), "ids");
+        ck(cudaDeviceSynchronize(), "ids");
+        K::DmRouteArgs ra;
+        ra.ids = d_ids; ra.x = d_x; ra.n_tok = T; ra.k = (int) KK; ra.n_embd = (int) H; ra.n_expert = (int) NE;
+        ra.layer = l; ra.res0 = d_res0; ra.res1 = d_res1; ra.cache_base = d_blob; ra.blob = (long long) L.bytes;
+        ra.plan = d_plan; ra.xq = d_xq2; ra.ring_m = h_ring; ra.x_m = h_x; ra.xq_m = h_xq; ra.host_seq_m = h_words;
+        ra.peer_seq_m = h_words + 16; ra.ring = 1; ra.ctr = d_ctr;
+        double t[3];
+        int i = 0;
+        for (int num : {0, 1, 64}) {
+            K::DmRouteArgs rb = ra;
+            if (num > 0) { rb.pcie_tab = d_tab; rb.pcie_num = num; }
+            t[i++] = time_us(s0, 400, [&] { K::dec_moe_route(rb, s0); });
+        }
+        std::printf("  bench: route T=5: no tier %.2f us | tier on, share 1/256 (takes nothing) %.2f us | share 64/256 %.2f us\n", t[0], t[1], t[2]);
+    }
     // microbench: m groups (one entry each) fetched from the arena, rebased and computed, against the same groups in VRAM;
     // the sets rotate over the arena so the L2 holds none of them
     for (int m : {1, 2, 4, 6, 8, 12, 16}) {
