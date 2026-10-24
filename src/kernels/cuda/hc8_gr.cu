@@ -29,7 +29,7 @@ constexpr int G8 = 32;
 constexpr int DOWN_ROWS = 2;      // rows per down CTA
 constexpr int DOWN_THREADS = 160;
 constexpr int UP_THREADS = 256;
-constexpr int UP_BLOCKS_PER_SM = 4;   // resident blocks an SM must hold: the grid then runs in one wave
+constexpr int UP_BLOCKS_PER_SM = 4;   // resident blocks an SM the up kernel's register use is capped for
 
 struct Hc8Gr {
     const float* R[MT];
@@ -119,7 +119,8 @@ __device__ void hc8_down(const Hc8Gr& p, int blk) {
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
             const int e = lane + 32 * k;
-            r4[k] = g0 + (e >> 3) < gpr ? reinterpret_cast<const float4*>(v + (size_t) g0 * G8)[e] : make_float4(0.f, 0.f, 0.f, 0.f);
+            r4[k] = g0 + (e >> 3) < gpr ? reinterpret_cast<const float4*>(v + (size_t) g0 * G8)[e]
+                                        : make_float4(0.f, 0.f, 0.f, 0.f);
         }
     };
     auto stage4 = [&](const float4 (&r4)[8]) {
@@ -337,7 +338,8 @@ bool hc8_gr_read_multi(const FusedGrArgs* a, int n_tok, int64_t n_embd, int64_t 
     p.apply = a[0].apply; p.eps = a[0].eps;
     cudaStream_t st = (cudaStream_t) stream;
     launch_pdl(hc8_norm_kernel, dim3((unsigned) hc, (unsigned) n_tok), dim3(256), 0, st, p);
-    launch_pdl(hc8_down_kernel, dim3((unsigned) ((p.lr + p.ninj + DOWN_ROWS - 1) / DOWN_ROWS)), dim3(DOWN_THREADS), 0, st, p);
+    const unsigned down_blocks = (unsigned) ((p.lr + p.ninj + DOWN_ROWS - 1) / DOWN_ROWS);
+    launch_pdl(hc8_down_kernel, dim3(down_blocks), dim3(DOWN_THREADS), 0, st, p);
     hc8_up_kernel<<<(unsigned) ((n_embd + UP_THREADS / 32 - 1) / (UP_THREADS / 32)), UP_THREADS, 0, st>>>(p);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
