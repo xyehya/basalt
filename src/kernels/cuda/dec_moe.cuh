@@ -148,10 +148,10 @@ __device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int t
 // Of the distinct experts that would go to the CPU pool and that the GPU can read from the mapped arena (tab[e] != 0), the
 // last num / 256 in routing order (at most kDmPcieMax) become kind 1: all their entries, whole groups.  A candidate is a valid
 // id not repeated within its token, as the VRAM tier requires.  With `plan` the groups also go to its ptr2 / start2 / dst2 /
-// tok2 (entries numbered from 0) and pcie[0], pcie[1].  Every thread of the block calls it; returns the groups taken.
+// tok2 (entries numbered from 0) and pcie[0], pcie[1].  Every thread of the block calls it; returns the groups taken.  The three
+// scratch arrays (kDmCap ints each) are shared memory the caller does not use at this point.
 __device__ int dm_pcie_tier(const int32_t* s_ids, int32_t* s_kind, int n, int k, int n_expert, const unsigned long long* tab,
-                            int num, DmPlan* plan, int tid) {
-    __shared__ int32_t s_cand[kDmCap], s_first[kDmCap], s_gcnt[kDmCap];
+                            int num, DmPlan* plan, int tid, int32_t* s_cand, int32_t* s_first, int32_t* s_gcnt) {
     int e = -1;
     bool cand = false;
     if (tid < n) {
@@ -260,7 +260,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     int n_pcie = 0;
     if (a.pcie_tab != nullptr && a.pcie_num > 0)
         n_pcie = dm_pcie_tier(s_ids, s_kind, n, a.k, a.n_expert, a.pcie_tab, a.pcie_num,
-                              blockIdx.x == 0 && (a.mode != 2 || a.kinds) ? a.plan : nullptr, tid);
+                              blockIdx.x == 0 && (a.mode != 2 || a.kinds) ? a.plan : nullptr, tid, s_first, s_cnt, s_gstart);
     if (tid < n) {
         if (s_kind[tid] < 0) atomicAdd(&s_ncpu, 1);
         else if (s_kind[tid] == 2) atomicAdd(&s_npeer, 1);
@@ -406,8 +406,9 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
 
 // ---------------------------------------------------------------- DEC_GLUE & 1: the route inside gate/up
 // DEC_GLUE & 2: dm_route_kernel's mode 2 (with kinds) in one block, the mapped q8_1 rows copied from `xq` (the
-// same q8_1_store bits); called after the block's pdl_wait
-__device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
+// same q8_1_store bits); called after the block's pdl_wait.  `scratch`: 3 * kDmCap ints of the kernel's shared memory (this block
+// has no other use for it)
+__device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid, int32_t* scratch) {
     __shared__ int32_t r_ids[kDmCap], r_kind[kDmCap], r_pf[kDmCap];
     __shared__ int32_t r_ncpu, r_npeer, r_nvram;
     const int n = a.n_tok * a.k;
@@ -444,7 +445,8 @@ __device__ void dm_glue_ring(const DmRouteArgs& a, const void* xq, int tid) {
     }
     int r_npcie = 0;
     if (a.pcie_tab != nullptr && a.pcie_num > 0)
-        r_npcie = dm_pcie_tier(r_ids, r_kind, n, a.k, a.n_expert, a.pcie_tab, a.pcie_num, a.kinds ? a.plan : nullptr, tid);
+        r_npcie = dm_pcie_tier(r_ids, r_kind, n, a.k, a.n_expert, a.pcie_tab, a.pcie_num, a.kinds ? a.plan : nullptr, tid, scratch,
+                               scratch + kDmCap, scratch + 2 * kDmCap);
     if (tid < n) {
         if (r_kind[tid] < 0) atomicAdd(&r_ncpu, 1);
         else if (r_kind[tid] == 2) atomicAdd(&r_npeer, 1);
@@ -519,7 +521,7 @@ __global__ void __launch_bounds__(256, 2) dm_glue_gu_kernel(DmGlueArgs a, Native
             if (a.ring.res1 != nullptr) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res1 + tid * 32));
         }
         pdl_wait();
-        dm_glue_ring(a.ring, a.xq, tid);
+        dm_glue_ring(a.ring, a.xq, tid, (int32_t*) s_tab);
         return;
     }
     for (int i = tid; i < a.n_expert; i += 256) s_tab[i] = 0u;
@@ -709,7 +711,7 @@ __global__ void __launch_bounds__(256, 4) dm_glue_gu1_kernel(DmGlueArgs a, Nativ
             if (a.ring.res1 != nullptr) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ring.res1 + tid * 32));
         }
         pdl_wait();
-        dm_glue_ring(a.ring, a.xq, tid);
+        dm_glue_ring(a.ring, a.xq, tid, (int32_t*) s_tab);
         return;
     }
     const int wb = (int) blockIdx.x - (a.ring_on && blockIdx.x > 1 ? 1 : 0);   // the block's place among the workers
