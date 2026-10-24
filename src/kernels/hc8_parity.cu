@@ -1,19 +1,27 @@
-// src/kernels/hc8_parity.cpp - the reads and products that take a hyper-connection matrix held only as its 8-bit copy
+// src/kernels/hc8_parity.cu - the reads and products that take a hyper-connection matrix held only as its 8-bit copy
 // (DEC_HC8, hc_fused.hpp's hc8_adopt), real geometry and random inputs (GPU, synthetic, no model):
 //
 //   1. hc8_gr_read_multi (what fused_gr_read, fused_gr_read_multi and gr_read run for such matrices) against
 //      fused_gr_read_multi on the bf16 matrices (the error the copies add) and on the copies dequantized to bf16 (the
 //      kernels' own error), 1..8 tokens, with and without the pending write and the injection; every token's outputs
 //      bitwise the same whatever the token count and column; gr_read bitwise the one-token read.
+//   1b. The read on the copies against frozen hashes of its outputs (taken from the kernels before the early-start
+//      change), for several geometries (the model's, no injection, other widths and stream counts), 1..8 tokens, with
+//      and without the pending write, launched plain and as a programmatic dependent behind a kernel; inputs come from
+//      raw mt19937 words (integers times powers of two), so the hashes do not depend on the C++ library. And the
+//      dependency itself: a producer kernel triggers its dependents at once, spins, then writes the read's inputs; the
+//      read started early behind it must still give the frozen hashes (a read before pdl_wait would see zeros).
 //   2. Gemm::bf16_w (the prompt path's product on a copy) against Gemm::bf16 on the bf16 matrix and against a
 //      double-precision product with the copy's exact values, on the prompt path's hc shapes, with a scratch that holds
 //      the whole matrix and with one that slices it (within fp32 rounding: cuBLAS's kernel can change with the width).
-//   3. --bench: the read's time (weights cold in L2) and the products' time against the bf16 ones.
+//   3. --bench: the read's time (weights cold in L2), plain and as a programmatic dependent, and the products' time against
+//      the bf16 ones.  Per-kernel times (norm, down, up): `nsys profile build/hc8_parity --bench`, kernels hc8_*.
 //
 //     build/hc8_parity [--bench]
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/pdl.hpp"
 #include "basalt/prefill/gemm.hpp"
 
 #include <cuda_runtime.h>
@@ -25,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -62,6 +71,165 @@ struct Err {
 int g_fail = 0;
 void expect(bool ok, const char* what) {
     if (!ok) { std::printf("FAIL: %s\n", what); ++g_fail; }
+}
+
+
+// ---- 1b. frozen outputs and the early-start dependency
+uint64_t fnv(uint64_t h, const void* p, size_t n) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+// a signed 16-bit integer times 2^-shift: exact in float, the same on every standard library
+struct Words {
+    std::mt19937 g;
+    explicit Words(uint32_t seed) : g(seed) {}
+    float sym(int shift) { return (float) ((int) (g() >> 16) - 32768) * std::ldexp(1.0f, -shift); }
+};
+struct Case { int N, HC, LR; bool inject; };
+constexpr int kCases = 5;
+constexpr Case kCase[kCases] = {
+    {2560, 4, 320, true}, {2560, 4, 320, false}, {2304, 4, 320, true}, {2080, 1, 128, true}, {2112, 3, 96, true}};
+// FNV-1a of lo, inject (when there is one), mixed, R' and rs for the first T tokens: [case][pending write][T - 1]
+const uint64_t kFrozen[kCases][2][8] = {
+    {{0x763ee1ef95614510ull, 0xcf024d9e11e68d4aull, 0xbc1fb7cf0d9a2a00ull, 0xa9801e3a77ac7089ull,
+      0xd99ec96fa0e8132bull, 0xffc444eacf8c4072ull, 0x85a1b9073412694aull, 0xbe042f9153244957ull},
+     {0xede6915c6925c904ull, 0xeba002f3662419f6ull, 0x1bb285dfaa635e9cull, 0xf63c76c8a5ad0bf3ull,
+      0xdc23baabc2ce18f4ull, 0x19018c0094bbb9baull, 0xc1bba0dfc68ca0adull, 0xa492f7621d8a6c0full}},
+    {{0x5b5dd8daff42cab6ull, 0xd8e85cc894bf5588ull, 0x9661835119d3660bull, 0x0f6b451515eda174ull,
+      0xd3072fdaac5444baull, 0x48ef8098e0c73a6cull, 0x7c3773205f00fa3cull, 0x7c9315b19f0197fdull},
+     {0x736b26b511120950ull, 0x1cb08143e8aff1e2ull, 0xfad7a4671cf20f9dull, 0xbf897120e47c5a06ull,
+      0xb417c4f692aad2b1ull, 0xc8a6cefdc5c3ba86ull, 0x004f5cb1d464d54bull, 0xad13ef673dc4376bull}},
+    {{0x59460c455f5ed29dull, 0x13ba7ca385150979ull, 0x3e2f9128fa159352ull, 0x1ed3e48817ccdd6dull,
+      0x600ec0653ae6b5dfull, 0x9d5f79c32e59b6cbull, 0x760728981ce282baull, 0x4cffc540edc2d570ull},
+     {0xf94983c75077c4f5ull, 0xa15d9f49ef9f0499ull, 0x866e5da61dce86a2ull, 0x3d4be3c223d863a5ull,
+      0xa93668f5142372c3ull, 0xb1a576e8a5f7d77aull, 0x957a3a1e4be5ba54ull, 0x18af3730971c4abcull}},
+    {{0xe9cec9b66fc1aaf2ull, 0x51d619dc7e1ab2f5ull, 0x3c008c8580733822ull, 0xef9304a276a8678full,
+      0x2b10f13d89aa3a96ull, 0xc3d65a1cf0afa92bull, 0x2dc0debbeb7f36e7ull, 0x7bc3fecbbcbde14bull},
+     {0x217c58df69439bc6ull, 0x02c1b0c3f9fcb4baull, 0xb0ab0bb0244c8835ull, 0x6e19f31c62ce6f67ull,
+      0x43c25aa5627ab417ull, 0xb30f5b9b86612307ull, 0xa8747b2cb77bd477ull, 0xa15047a8c8eac2d7ull}},
+    {{0xef87a80c784d33a6ull, 0xe7e079c011d56f02ull, 0x8db3e760656d3dd9ull, 0xfc921207352056faull,
+      0xad1b0e9a4e8f785bull, 0x4af45569b10ea122ull, 0xb8cc7bd7bdbf0993ull, 0xf2e91e4a9cf1300eull},
+     {0x076392137beed088ull, 0xf878f20bd68f7c6full, 0xed59989ab98e082cull, 0x0443f8e8c67c6156ull,
+      0xfa369d17cf3edc9aull, 0xe9eab46a088e8932ull, 0xdd5823e831bb9088ull, 0xf70f09f053410681ull}}};
+constexpr int kTok = 8;
+
+// stands in for the kernel before the read: lets its dependents start at once, spins, then writes the read's inputs
+__global__ void producer(float* R, const float* R0, size_t nR, float* bo, const float* bo0, size_t nb, float* inj, const float* inj0,
+                         size_t ni, long long spin) {
+    K::pdl_launch_dependents();
+    const long long t0 = clock64();
+    while (clock64() - t0 < spin) {}
+    const size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x, st = (size_t) gridDim.x * blockDim.x;
+    for (size_t i = tid; i < nR; i += st) R[i] = R0[i];
+    for (size_t i = tid; i < nb; i += st) bo[i] = bo0[i];
+    for (size_t i = tid; i < ni; i += st) inj[i] = inj0[i];
+}
+
+template <typename V>
+V* upload(const std::vector<V>& h) {
+    V* d;
+    cudaMalloc((void**) &d, h.size() * sizeof(V));
+    cudaMemcpy(d, h.data(), h.size() * sizeof(V), cudaMemcpyHostToDevice);
+    return d;
+}
+
+struct Rig {
+    Case c;
+    int D;
+    std::vector<float> R;
+    float *R0, *bo0, *inj0, *dR, *dbo, *dinj, *dwn, *lo, *rs, *io, *mix;
+    const void *kd, *ku, *ki;
+    K::Hc8View vi;
+    uint16_t* dqi;
+    cudaStream_t pst;
+    explicit Rig(int idx) : c(kCase[idx]), D(c.N * c.HC) {
+        Words w(7 + idx);
+        auto fill = [&](size_t n, int shift) { std::vector<float> v(n); for (auto& x : v) x = w.sym(shift); return v; };
+        R = fill((size_t) kTok * D, 14);
+        const std::vector<float> bo = fill((size_t) kTok * c.N, 15), inj = fill((size_t) kTok * c.HC, 14);
+        std::vector<float> wn = fill(D, 17);
+        for (auto& x : wn) x += 1.0f;
+        auto bf = [&](size_t n, int shift) { std::vector<uint16_t> v(n); for (auto& x : v) x = bf16(w.sym(shift)); return v; };
+        std::vector<uint16_t> wd = bf((size_t) c.LR * D, 20);
+        const std::vector<uint16_t> wu = bf((size_t) D * c.LR, 19), wi = bf((size_t) c.HC * D, 20);
+        for (int k = 0; k < 16; ++k) wd[(size_t) ((k * 5) % c.LR) * D + (k * 101) % D] = bf16(0.6f);   // outliers that set a group's scale
+        uint16_t *dwd = upload(wd), *dwu = upload(wu), *dwi = upload(wi);
+        kd = K::hc8_adopt(dwd, c.LR, D); ku = K::hc8_adopt(dwu, D, c.LR); ki = K::hc8_adopt(dwi, c.HC, D);
+        expect(kd && ku && ki && K::hc8_view(ki, vi), "adopt");
+        cudaFree(dwd); cudaFree(dwu); cudaFree(dwi);
+        R0 = upload(R); bo0 = upload(bo); inj0 = upload(inj); dwn = upload(wn);
+        cudaMalloc((void**) &dR, R.size() * 4); cudaMalloc((void**) &dbo, bo.size() * 4); cudaMalloc((void**) &dinj, inj.size() * 4);
+        cudaMalloc((void**) &lo, (size_t) kTok * c.LR * 4); cudaMalloc((void**) &rs, (size_t) kTok * c.HC * 4);
+        cudaMalloc((void**) &io, (size_t) kTok * c.HC * 4); cudaMalloc((void**) &mix, (size_t) kTok * c.N * 4);
+        cudaMalloc((void**) &dqi, (size_t) c.HC * D * 2);
+        cudaStreamCreate(&pst);   // blocking: ordered after the default-stream copies
+    }
+    // mode 0: plain launch; 1: behind a kernel that does not touch the read's data; 2: behind a producer that writes the
+    // inputs after letting its dependents start; 3: the producer, plain launch (stream order only)
+    uint64_t read(int T, bool apply, int mode) {
+        const size_t nb = (size_t) kTok * c.N, ni = (size_t) kTok * c.HC;
+        if (mode >= 2) {
+            cudaMemset(dR, 0, R.size() * 4); cudaMemset(dbo, 0, nb * 4); cudaMemset(dinj, 0, ni * 4);
+        } else {
+            cudaMemcpy(dR, R0, R.size() * 4, cudaMemcpyDeviceToDevice); cudaMemcpy(dbo, bo0, nb * 4, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(dinj, inj0, ni * 4, cudaMemcpyDeviceToDevice);
+        }
+        cudaMemset(lo, 0xff, (size_t) kTok * c.LR * 4); cudaMemset(rs, 0xff, (size_t) kTok * c.HC * 4);
+        cudaMemset(io, 0xff, ni * 4); cudaMemset(mix, 0xff, nb * 4);
+        cudaDeviceSynchronize();
+        std::unique_ptr<K::PdlScope> scope;
+        if (mode >= 2) producer<<<64, 256, 0, pst>>>(dR, R0, R.size(), dbo, bo0, nb, dinj, inj0, ni, 200000);
+        if (mode == 1) K::hc8_dequant_bf16(vi, 0, c.HC, dqi, pst);
+        if (mode == 1 || mode == 2) scope.reset(new K::PdlScope(true, false));
+        K::FusedGrArgs a[K::kFusedGrMaxT];
+        for (int t = 0; t < T; ++t) {
+            K::FusedGrArgs& x = a[t];
+            x.R = dR + (size_t) t * D; x.R_out = dR + (size_t) t * D; x.apply = apply;
+            x.bo_prev = dbo + (size_t) t * c.N; x.inj_prev = dinj + (size_t) t * c.HC; x.w_norm = dwn;
+            x.w_down = (const uint16_t*) kd; x.w_up = (const uint16_t*) ku; x.w_inject = c.inject ? (const uint16_t*) ki : nullptr;
+            x.eps = 1e-6f; x.lo = lo + (size_t) t * c.LR; x.rs = rs + (size_t) t * c.HC;
+            x.inject_out = io + (size_t) t * c.HC; x.mixed = mix + (size_t) t * c.N;
+        }
+        expect(K::hc8_gr_read_multi(a, T, c.N, c.HC, mode ? (void*) pst : nullptr), "hc8_gr_read_multi");
+        scope.reset();
+        cudaDeviceSynchronize();
+        uint64_t h = 14695981039346656037ull;
+        const size_t cnt[5] = {(size_t) T * c.LR, (size_t) T * c.HC, (size_t) T * c.N, (size_t) T * D, (size_t) T * c.HC};
+        const float* src[5] = {lo, io, mix, dR, rs};
+        for (int k = 0; k < 5; ++k) {
+            if (k == 1 && !c.inject) continue;
+            const std::vector<float> v = get(src[k], cnt[k]);
+            h = fnv(h, v.data(), v.size() * 4);
+        }
+        return h;
+    }
+};
+
+void frozen_checks() {
+    static const char* const kMode[4] = {"plain launch", "early start behind a kernel", "early start behind a producer",
+                                         "producer, plain launch"};
+    for (int idx = 0; idx < kCases; ++idx) {
+        Rig rig(idx);
+        const Case& c = rig.c;
+        int bad = 0, n = 0;
+        for (int mode = 0; mode < 4; ++mode)
+            for (int apply = 0; apply < 2; ++apply)
+                for (int T = 1; T <= kTok; ++T)
+                    for (int rep = 0; rep < (mode >= 2 && idx == 0 ? 3 : 1); ++rep) {
+                        if (mode >= 2 && idx > 1) continue;
+                        const uint64_t h = rig.read(T, apply != 0, mode);
+                        const bool ok = h == kFrozen[idx][apply][T - 1];
+                        ++n; bad += !ok;
+                        if (!ok || mode == 0)
+                            std::printf("  frozen n_embd %d hc %d lr %d %s, %s, %d token%s, %s: %016llx %s\n", c.N, c.HC, c.LR,
+                                        c.inject ? "inject" : "no inject", apply ? "pending write" : "no write", T, T == 1 ? "" : "s",
+                                        kMode[mode], (unsigned long long) h, ok ? "ok" : "DIFFERS");
+                    }
+        std::printf("frozen outputs, n_embd %d hc %d lr %d %s: %d reads, %d differ\n", c.N, c.HC, c.LR,
+                    c.inject ? "inject" : "no inject", n, bad);
+        expect(bad == 0, "the read's outputs against the frozen hashes");
+    }
 }
 
 }  // namespace
@@ -152,7 +320,6 @@ int main(int argc, char** argv) {
             run(1, o[1], all, apply, inject);
             run(2, o[2], all, apply, inject);
             Err e[2][5];
-            const float* dev[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
             const size_t n[5] = {(size_t) TM * N, (size_t) TM * LR, (size_t) TM * HC, (size_t) TM * HC, (size_t) TM * D};
             const char* nm[5] = {"mixed", "lo", "inject", "rs", "R'"};
             std::vector<float> h0[5], h1[5], h2[5];
@@ -164,7 +331,6 @@ int main(int argc, char** argv) {
                 h0[k] = get(p0[k], n[k]); h1[k] = get(p1[k], n[k]); h2[k] = get(p2[k], n[k]);
                 for (size_t i = 0; i < n[k]; ++i) { e[0][k].add(h0[k][i], h1[k][i]); e[1][k].add(h0[k][i], h2[k][i]); }
             }
-            (void) dev;
             std::printf("read, 8 tokens, %s, %s:\n", apply ? "pending write" : "no write", inject ? "injection" : "no injection");
             for (int k = 0; k < 5; ++k) {
                 if (k == 2 && !inject) continue;
@@ -189,6 +355,7 @@ int main(int argc, char** argv) {
             std::printf("  token count / column independence: %s\n", same ? "bitwise" : "DIFFERS");
             expect(same, "token count / column independence");
         }
+    frozen_checks();
     {   // gr_read on the copies: the one-token read
         const K::GrShapes gs{N, HC, LR};
         void* wsb = nullptr;
@@ -311,6 +478,17 @@ int main(int argc, char** argv) {
             const double u16 = time_us([&] { K::fused_gr_read_multi(a[1], T, o[1].xn, st); }, 50, true);
             std::printf("read T %d (cold L2): 8-bit %.1f us (%.0f GB/s of %.1f MB) | bf16 fused_gr %.1f us (%.0f GB/s of %.1f MB)\n",
                         T, u8, b8 / u8 / 1e3, b8 / 1e6, u16, b16 / u16 / 1e3, b16 / 1e6);
+            // the same read behind a kernel that leaves its data alone: plain, and started early as a programmatic dependent
+            const double ub = time_us([&] {
+                K::hc8_dequant_bf16(vi, 0, HC, dqi, st);
+                K::fused_gr_read_multi(a[0], T, o[0].xn, st);
+            }, 50, true);
+            const double ue = time_us([&] {
+                K::hc8_dequant_bf16(vi, 0, HC, dqi, st);
+                K::PdlScope scope(true, false);
+                K::fused_gr_read_multi(a[0], T, o[0].xn, st);
+            }, 50, true);
+            std::printf("read T %d behind a kernel (cold L2): plain %.1f us | early start %.1f us\n", T, ub, ue);
         }
         for (int64_t T : {512, 2048, 8192}) {
             uint16_t* dX;

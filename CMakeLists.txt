@@ -599,7 +599,7 @@ target_include_directories(gdn_chunk_parity PRIVATE ${CMAKE_SOURCE_DIR}/include)
 basalt_gpu_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity)
 # the hyper-connection reads and prompt-path products on matrices held only as 8-bit copies
 # against the bf16 ones (GPU, synthetic, no model; --bench adds timings)
-add_executable(hc8_parity src/kernels/hc8_parity.cpp)
+add_executable(hc8_parity src/kernels/hc8_parity.cu)
 target_include_directories(hc8_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(hc8_parity PRIVATE prefill kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME hc8_parity COMMAND hc8_parity)

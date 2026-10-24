@@ -6,9 +6,11 @@
 //   down : lo[k] = silu((q_down[k] . xn) / hc),  inject[c] = q_inject[c] . xn,  xn = R' * w_norm * rs (on the fly)
 //   up   : mixed[d] = mean_c xn[c,d] * sigmoid(q_up[c*n_embd + d] . lo)
 //
-// Every token's values come from the same operations in the same order whatever the token count.
+// Every token's values come from the same operations in the same order whatever the token count.  Inside a PdlScope the
+// norm and down kernels start while the kernel before them finishes (pdl.hpp): each reads only constants until pdl_wait.
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -27,6 +29,7 @@ constexpr int G8 = 32;
 constexpr int DOWN_ROWS = 2;      // rows per down CTA
 constexpr int DOWN_THREADS = 160;
 constexpr int UP_THREADS = 256;
+constexpr int UP_BLOCKS_PER_SM = 4;   // resident blocks an SM the up kernel's register use is capped for
 
 struct Hc8Gr {
     const float* R[MT];
@@ -79,11 +82,23 @@ __device__ void hc8_norm(const Hc8Gr& p, int c, int t) {
         p.rs[t][c] = rsqrtf(s / (float) n + p.eps);
     }
 }
-__global__ void hc8_norm_kernel(Hc8Gr p) { hc8_norm(p, blockIdx.x, blockIdx.y); }
+__global__ void hc8_norm_kernel(Hc8Gr p) {
+    pdl_wait();
+    pdl_launch_dependents();   // the down kernel may start and read its constants while the norm finishes
+    hc8_norm(p, blockIdx.x, blockIdx.y);
+}
 
-// DOWN_ROWS rows of [q_down; q_inject] per CTA; a thread takes whole scale groups
+// DOWN_ROWS rows of [q_down; q_inject] per CTA; a lane takes whole scale groups, a warp 32 consecutive ones.  The
+// activations and w_norm of the warp's groups reach shared memory by coalesced loads (rows padded to avoid bank
+// conflicts) and each lane reads its own group from there; the arithmetic and its order are those of a lane reading
+// them from global memory.  The weights, scales and w_norm are constants: they are read before the grid dependency
+// wait, the activations and rs (the norm kernel's results) after it.
+constexpr int DOWN_WARPS = DOWN_THREADS / 32;
+constexpr int XS_STRIDE = G8 + 4;   // floats per staged group
 __device__ void hc8_down(const Hc8Gr& p, int blk) {
-    __shared__ float red[DOWN_THREADS / 32][DOWN_ROWS][MT];
+    __shared__ float red[DOWN_WARPS][DOWN_ROWS][MT];
+    __shared__ __align__(16) float xs[DOWN_WARPS][32 * XS_STRIDE];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int D = p.n * p.hc, gpr = D / G8, nrows = p.lr + p.ninj;
     const int8_t* q[DOWN_ROWS];
     const uint16_t* s[DOWN_ROWS];
@@ -98,53 +113,94 @@ __device__ void hc8_down(const Hc8Gr& p, int blk) {
     for (int r = 0; r < DOWN_ROWS; ++r)
 #pragma unroll
         for (int t = 0; t < MT; ++t) acc[r][t] = 0.0f;
-    for (int g = threadIdx.x; g < gpr; g += blockDim.x) {
-        const int col0 = g * G8, c = col0 / p.n;
+    float* tile = xs[warp];
+    // the warp's 32 groups of one vector (float4 e of the 8 per group: group e / 8, quarter e % 8) into the padded tile
+    auto load4 = [&](const float* v, int g0, float4 (&r4)[8]) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int e = lane + 32 * k;
+            r4[k] = g0 + (e >> 3) < gpr ? reinterpret_cast<const float4*>(v + (size_t) g0 * G8)[e]
+                                        : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    auto stage4 = [&](const float4 (&r4)[8]) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int e = lane + 32 * k;
+            *reinterpret_cast<float4*>(tile + (e >> 3) * XS_STRIDE + (e & 7) * 4) = r4[k];
+        }
+    };
+    bool waited = false;
+    for (int g0 = warp * 32; g0 < gpr; g0 += DOWN_THREADS) {
+        const int g = g0 + lane, col0 = g * G8, c = col0 / p.n;
+        const bool live = g < gpr;
         float wq[DOWN_ROWS][G8];
         float sc[DOWN_ROWS];
         {
-            float wn[G8];
-            const float4* w4 = reinterpret_cast<const float4*>(p.w_norm + col0);
-#pragma unroll
-            for (int j = 0; j < G8 / 4; ++j) {
-                const float4 v = w4[j];
-                wn[4 * j] = v.x; wn[4 * j + 1] = v.y; wn[4 * j + 2] = v.z; wn[4 * j + 3] = v.w;
-            }
+            float4 v4[8];
+            load4(p.w_norm, g0, v4);
+            uint4 qa[DOWN_ROWS], qb[DOWN_ROWS];
 #pragma unroll
             for (int r = 0; r < DOWN_ROWS; ++r) {
-                const uint4 a = reinterpret_cast<const uint4*>(q[r] + col0)[0];
-                const uint4 b = reinterpret_cast<const uint4*>(q[r] + col0)[1];
-                const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+                qa[r] = qb[r] = make_uint4(0, 0, 0, 0);
+                sc[r] = 0.0f;
+                if (live) {
+                    qa[r] = reinterpret_cast<const uint4*>(q[r] + col0)[0];
+                    qb[r] = reinterpret_cast<const uint4*>(q[r] + col0)[1];
+                    sc[r] = f16f(s[r][g]);
+                }
+            }
+            stage4(v4);
+            __syncwarp();
+            float wn[G8];
+#pragma unroll
+            for (int j = 0; j < G8 / 4; ++j) {
+                const float4 v = *reinterpret_cast<const float4*>(tile + lane * XS_STRIDE + 4 * j);
+                wn[4 * j] = v.x; wn[4 * j + 1] = v.y; wn[4 * j + 2] = v.z; wn[4 * j + 3] = v.w;
+            }
+            __syncwarp();
+#pragma unroll
+            for (int r = 0; r < DOWN_ROWS; ++r) {
+                const uint32_t w[8] = {qa[r].x, qa[r].y, qa[r].z, qa[r].w, qb[r].x, qb[r].y, qb[r].z, qb[r].w};
 #pragma unroll
                 for (int i = 0; i < G8; ++i) wq[r][i] = s8(w[i >> 2], i & 3) * wn[i];
-                sc[r] = f16f(s[r][g]);
             }
         }
+        if (!waited) { pdl_wait(); waited = true; }
+        // tokens in a runtime loop, the next one's loads in flight during this one's arithmetic; the accumulator of
+        // token t is picked by an unrolled compare so that it stays in registers
+        float4 x4[8];
+        load4(src_of(p, 0), g0, x4);
+        for (int t = 0; t < p.T; ++t) {
+            stage4(x4);
+            __syncwarp();
+            if (t + 1 < p.T) load4(src_of(p, t + 1), g0, x4);
+            float d[DOWN_ROWS];
 #pragma unroll
-        for (int t = 0; t < MT; ++t) {
-            if (t < p.T) {
-                const float4* x4 = reinterpret_cast<const float4*>(src_of(p, t) + col0);
-                float d[DOWN_ROWS];
+            for (int r = 0; r < DOWN_ROWS; ++r) d[r] = 0.0f;
 #pragma unroll
-                for (int r = 0; r < DOWN_ROWS; ++r) d[r] = 0.0f;
+            for (int j = 0; j < G8 / 4; ++j) {
+                const float4 v = *reinterpret_cast<const float4*>(tile + lane * XS_STRIDE + 4 * j);
 #pragma unroll
-                for (int j = 0; j < G8 / 4; ++j) {
-                    const float4 v = x4[j];
-#pragma unroll
-                    for (int r = 0; r < DOWN_ROWS; ++r) {
-                        d[r] = fmaf(wq[r][4 * j], v.x, d[r]);
-                        d[r] = fmaf(wq[r][4 * j + 1], v.y, d[r]);
-                        d[r] = fmaf(wq[r][4 * j + 2], v.z, d[r]);
-                        d[r] = fmaf(wq[r][4 * j + 3], v.w, d[r]);
-                    }
+                for (int r = 0; r < DOWN_ROWS; ++r) {
+                    d[r] = fmaf(wq[r][4 * j], v.x, d[r]);
+                    d[r] = fmaf(wq[r][4 * j + 1], v.y, d[r]);
+                    d[r] = fmaf(wq[r][4 * j + 2], v.z, d[r]);
+                    d[r] = fmaf(wq[r][4 * j + 3], v.w, d[r]);
                 }
+            }
+            __syncwarp();
+            if (live) {
                 const float rs = p.rs[t][c];
 #pragma unroll
-                for (int r = 0; r < DOWN_ROWS; ++r) acc[r][t] = fmaf(sc[r] * rs, d[r], acc[r][t]);
+                for (int r = 0; r < DOWN_ROWS; ++r)
+#pragma unroll
+                    for (int tt = 0; tt < MT; ++tt)
+                        if (tt == t) acc[r][tt] = fmaf(sc[r] * rs, d[r], acc[r][tt]);
             }
         }
     }
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (!waited) pdl_wait();
 #pragma unroll
     for (int r = 0; r < DOWN_ROWS; ++r)
 #pragma unroll
@@ -160,7 +216,7 @@ __device__ void hc8_down(const Hc8Gr& p, int blk) {
         const int r = threadIdx.x / MT, t = threadIdx.x % MT, k = blk * DOWN_ROWS + r;
         if (t < p.T && k < nrows) {
             float v = 0.0f;
-            for (int w = 0; w < (int) (blockDim.x >> 5); ++w) v += red[w][r][t];
+            for (int w = 0; w < DOWN_WARPS; ++w) v += red[w][r][t];
             if (k < p.lr) {
                 const float x = v / (float) p.hc;
                 p.lo[t][k] = x / (1.0f + expf(-x));
@@ -238,7 +294,7 @@ __device__ void hc8_up(const Hc8Gr& p, int blk) {
         }
     }
 }
-__global__ void __launch_bounds__(UP_THREADS) hc8_up_kernel(Hc8Gr p) { hc8_up(p, blockIdx.x); }
+__global__ void __launch_bounds__(UP_THREADS, UP_BLOCKS_PER_SM) hc8_up_kernel(Hc8Gr p) { hc8_up(p, blockIdx.x); }
 
 }  // namespace
 
@@ -281,8 +337,9 @@ bool hc8_gr_read_multi(const FusedGrArgs* a, int n_tok, int64_t n_embd, int64_t 
     p.T = n_tok; p.n = (int) n_embd; p.hc = (int) hc; p.lr = vd.rows; p.ninj = inj ? (int) hc : 0;
     p.apply = a[0].apply; p.eps = a[0].eps;
     cudaStream_t st = (cudaStream_t) stream;
-    hc8_norm_kernel<<<dim3((unsigned) hc, (unsigned) n_tok), 256, 0, st>>>(p);
-    hc8_down_kernel<<<(unsigned) ((p.lr + p.ninj + DOWN_ROWS - 1) / DOWN_ROWS), DOWN_THREADS, 0, st>>>(p);
+    launch_pdl(hc8_norm_kernel, dim3((unsigned) hc, (unsigned) n_tok), dim3(256), 0, st, p);
+    const unsigned down_blocks = (unsigned) ((p.lr + p.ninj + DOWN_ROWS - 1) / DOWN_ROWS);
+    launch_pdl(hc8_down_kernel, dim3(down_blocks), dim3(DOWN_THREADS), 0, st, p);
     hc8_up_kernel<<<(unsigned) ((n_embd + UP_THREADS / 32 - 1) / (UP_THREADS / 32)), UP_THREADS, 0, st>>>(p);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
