@@ -2925,6 +2925,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         else
                             add(w->data, w->bytes);
                     }
+                    // then the FFN read's matrices: its 8-bit copies (codes and scales are one range), the router and
+                    // the shared expert's gate row
+                    for (const char* nm : {"hc_ffn_down.weight", "hc_ffn_inject.weight", "hc_ffn_up.weight"}) {
+                        const WeightRef* w = nv.get(nm);
+                        basalt::kernels::Hc8View hv;
+                        if (w != nullptr && basalt::kernels::hc8_view(w->data, hv)) add(hv.q, hv.bytes);
+                    }
+                    for (const char* nm : {"ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight"}) {
+                        const WeightRef* w = nv.get(nm);
+                        if (w != nullptr) add(w->data, w->bytes);
+                    }
                     pf.ids = ids_; pf.n_ids = n * (int) K; pf.n_expert = (int) g.n_expert; pf.ptab = dm_->ptab0 + l * g.n_expert;
                 }
                 cudaEventRecord(lz_fork_, cs);

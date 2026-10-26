@@ -60,7 +60,7 @@ void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, i
 /// `pf` (or null): what the launch also reads into L2 for the next layer while the layer it runs beside waits for the
 /// CPU pool: once *stop holds stop_value with its top bit (the combine waits) and while it still does, if the layer has
 /// entries off CUDA0 at all (ids against ptab, that layer's CUDA0 blob table).
-constexpr int kLazyPfRanges = 8;
+constexpr int kLazyPfRanges = 12;
 struct GdnLazyPf {
     const void* p[kLazyPfRanges] = {};   ///< byte ranges (16-byte multiples) in the order they are used; empty ones last
     uint64_t n[kLazyPfRanges] = {};
