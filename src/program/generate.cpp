@@ -1414,6 +1414,9 @@ int main(int argc, char** argv) {
     auto set_stream_all_min = [&]() {
         if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
+        // --exp stream_all_min=N: the chunk size from which every expert streams, for pricing it on a link
+        const double x = basalt::core::exp_flag("stream_all_min", 0.0);
+        if (x > 0) basalt::prefill::Prefill::set_stream_all_min((int64_t) x);
     };
     set_stream_all_min();
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
