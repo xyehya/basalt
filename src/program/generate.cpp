@@ -7098,7 +7098,7 @@ int main(int argc, char** argv) {
             if (pf_parts.empty() || pf_parts[0].first < 0) return 0;
             const int64_t k = part_slots(pf_parts[0], 256);
             int64_t f = k + 128;
-            if (o.prefill_auto) f = std::max<int64_t>(f, (k * 100 + kAutoLendPct - 1) / kAutoLendPct);
+            if (o.prefill_auto) f = std::max<int64_t>(f, (k * 100 + auto_lend_pct - 1) / auto_lend_pct);
             return std::min<int64_t>(f, xcache.full_slots());
         };
         bool kv_short = false;   // the last kv_fit refused: the cells would take the cache below its floor
