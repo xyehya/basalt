@@ -4280,8 +4280,10 @@ int main(int argc, char** argv) {
     // and its last token through the first verify window - the path all three model files share.  Decoding is greedy.
     // The expert-cache slots (from the end of the cache) that hold the prompt path's buffers for a chunk, and the
     // bytes from the first of them to the end.
-    // the share of expert bytes the arena could pin (sizes the prompt path's lend cap)
-    if (srcp != nullptr && o.prefill_chunk > 0) {
+    // the share of expert bytes the arena could pin (sizes the prompt path's lend cap); measured again once the RAM
+    // complement is pinned, since a source pins nothing before that
+    auto measure_pinned_share = [&]() {
+        if (srcp == nullptr || o.prefill_chunk <= 0) return;
         uint64_t pinned = 0, total = 0;
         const auto& lay = basalt::kernels::cpu::expert_layout();
         for (int64_t l = 0; l < g.n_layers; ++l)
@@ -4291,7 +4293,8 @@ int main(int argc, char** argv) {
                 if (srcp->pinned(l, e)) pinned += b;
             }
         basalt::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
-    }
+    };
+    measure_pinned_share();
     // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
     // per layer), otherwise max_blob each.
     auto cache_slots_for = [&](const basalt::core::ExpertCache& xc, uint64_t need) -> int64_t {
@@ -4318,13 +4321,14 @@ int main(int argc, char** argv) {
         return std::min(max_chunk, rounded);
     };
     // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits, or
-    // with --prefill auto the largest chunk whose buffers take at most kAutoLendPct % of the slots (a lent slot's
+    // with --prefill auto the largest chunk whose buffers take at most auto_lend_pct % of the slots (a lent slot's
     // expert is streamed during the prompt and refilled after it).  A request lends only what its own prompt needs
     // (Prefill::relayout), so a big chunk costs short prompts nothing.  0 = none fits.
     // At large chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the copies are DMA
     // from pinned RAM, 85% when host copies are the limit (lending more only streams more through them).
     // Hoisted out of plan_lend: the serve path's per-stage loans obey the same cap, one participant at a time.
-    const int64_t kAutoLendPct = basalt::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85;
+    auto lend_pct_for_share = [] { return basalt::prefill::Prefill::pinned_share() >= 0.9 ? (int64_t) 90 : (int64_t) 85; };
+    int64_t auto_lend_pct = lend_pct_for_share();
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
     // but never below 8192.  A bare `auto` is cut back once the RAM complement is built (below) to what the lend can
     // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
@@ -4382,7 +4386,7 @@ int main(int argc, char** argv) {
             // the largest chunk on the 256-token grid whose buffers fit the lend caps
             const int64_t c = biggest_chunk(auto_ceiling, [&](int64_t t) -> bool {
                 const int64_t k = slots_for(t);
-                return k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots();
+                return k + 128 <= xcache.slots() && k * 100 <= auto_lend_pct * xcache.slots();
             });
             if (c > 0) { chunk = c; return slots_for(c); }
             return 0;
@@ -4703,6 +4707,12 @@ int main(int argc, char** argv) {
                          (long long) xcache.resident(),
                          o.adapt_every > 0 && o.adapt_swaps > 0 ? "exchange them with the GPU cache (no file reads)"
                                                                 : "off");
+            measure_pinned_share();   // the loans sized from here on see the pinned complement
+            auto_lend_pct = lend_pct_for_share();
+            if (o.prefill_auto)
+                basalt::log::info("basalt generate", "prompt path lends at most %lld%% of the cache (%.0f%% of the expert "
+                                     "bytes pinned)", (long long) auto_lend_pct,
+                             100.0 * basalt::prefill::Prefill::pinned_share());
         } else if (o.resident_soft) {
             basalt::log::warn("basalt generate", "the resident RAM mode does not fit (%s)", err.c_str());
         } else if (o.resident_budget > 0) {
@@ -5016,7 +5026,7 @@ int main(int argc, char** argv) {
             auto fits_one = [&](const PfPart& p, int64_t c, bool cap) -> bool {
                 const int64_t k = part_slots(p, c);
                 if (k <= 0 || k + 128 > p.cache->slots()) return false;
-                return !(cap && k * 100 > kAutoLendPct * p.cache->slots());
+                return !(cap && k * 100 > auto_lend_pct * p.cache->slots());
             };
             // `only`: CUDA0's cache alone (what one GPU would choose, for the log below); null: every one
             auto fits = [&](int64_t c, bool cap, const PfPart* only = nullptr) -> bool {
@@ -5050,7 +5060,7 @@ int main(int argc, char** argv) {
                         prop.name[0] = 0;
                     }
                     const std::string pct =
-                        o.prefill_auto ? ", and lend at most " + std::to_string(kAutoLendPct) + "%" : "";
+                        o.prefill_auto ? ", and lend at most " + std::to_string(auto_lend_pct) + "%" : "";
                     basalt::log::warn("basalt serve", "prompt chunk %lld tokens, not %lld: CUDA%d (%s) "
                                          "has %lld expert-cache slots, and a %lld-token chunk borrows %lld of them "
                                          "(it must keep 128%s) - prompts read slower than on CUDA0 alone",
@@ -6670,7 +6680,7 @@ int main(int argc, char** argv) {
             PfPart& p = pf_parts[0];
             auto fits = [&](int64_t c) {
                 const int64_t k = part_slots(p, c);
-                return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
+                return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > auto_lend_pct * live);
             };
             // auto: the largest chunk on the start-up's 256-token grid, so a few slots lent away cost a few tokens
             // of chunk, not half of it
