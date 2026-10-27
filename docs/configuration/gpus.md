@@ -19,8 +19,10 @@ expert tier`:
 
 - **Expert tier.** Each card after the main one holds experts the main card does not, computes their rows in every
   decode window and follows the conversation like the main card's cache does. The experts are dealt out hottest first,
-  each to the tier with the least work so far for its memory bandwidth, until every tier is full. Every tier computes
-  its experts with the main card's kernels, so where an expert sits does not change its rows. The second card also
+  each to the tier with the least work so far for its memory bandwidth, until every tier is full. On two cards a second
+  card at least as fast as the main one also takes a share of the hottest experts, so both compute routed experts in
+  every layer; a slower second card takes the experts after the main card's. Every tier computes its experts with the
+  main card's kernels, so where an expert sits does not change its rows. The second card also
   computes its experts' share of each prompt chunk: of any chunk when it is as fast as the main card, of chunks up to
   2,559 rows when it is slower (a slower card costs a longer chunk more than the experts it saves the main card's link).
   When its memory is faster than the main card's it takes a share of each GDN mixer and of the head (one start line
@@ -62,18 +64,36 @@ when it prices at least 5% below it. Unlike cards always use the expert tier. Th
 measured windows (a 5090 with a 5060 Ti: tier 7.9 ms, plain layer split 13.4-13.7 ms measured at the cuts
 tried; two 5080s: 147 tok/s reported against 141 priced), good for the choice and not for forecasting a rate.
 
-## Long prompts on two cards
+## Long prompts across the cards
 
-In the expert tier with one tier card and one conversation at a time, a long fresh part of a prompt can be read as a
-pipeline. The main card reads the first layers of each chunk and hands the chunk on; the tier card reads the last layers
-of it while the main card reads the next chunk, then gives its layers' state back and gets its experts back. Its weights,
-prompt state and buffers go into its tier's last slots for the read (its weights from a pinned RAM copy made at start), so
-outside a prompt the tier holds what it held before and decode does not change. The engine prices each part both ways
-from each card's memory bandwidth, the probed link rates and the experts each card holds, and reads it across the cards
-only when that is at least 5% cheaper; the start and request lines begin with `prompt split:`. The chunks are the main
-card's own, so a part of one chunk (up to 32,768 tokens) stays on the main card. Off with `--peer-exclusive`, without the
-RAM copy of the experts, with KV streaming, a control vector, `--parallel`, experts other than NVFP4 (the price is fitted
-to those), or when RAM or the tier's slots are short.
+In the expert tier, a long fresh part of a prompt can be read as a pipeline over the main card and the tier cards while
+no other conversation decodes (with `--parallel`, while every other slot is idle). The main card reads the first layers
+of each chunk and hands the chunk on; each tier card reads the next block of layers of it while the cards before it read
+the next chunks, the last one ending at the last layer. The main card reads the last chunk's later layers itself once
+the tier cards have given their layers' state back and got their experts back. A tier card's weights, prompt state and
+buffers go into its tier's last slots for the read (its weights from a pinned RAM copy made at start), so outside a
+prompt the tiers hold what they held before and decode does not change. The engine prices each part on the main card
+alone and over every number of stages and every set of cuts, from each card's memory bandwidth, the probed link rates
+(each card's alone and all the cards' at once, which a shared switch or the RAM can hold below their sum) and the
+experts each card holds, and reads it across the cards only when that is at least 5% cheaper. Tier cards join in
+order of memory bandwidth, the fastest reading the last layers. At start each card gets the layers the stage counts
+worth it for a prompt of the context's length (up to 131,072 tokens) give it, plus a few. The start and request lines
+begin with `prompt split:` and print the prices; a part longer than one chunk that stays on the main card says why
+(`prompt split: N tokens read on CUDA0 (...)`). The chunks are the main card's own, so a part of one chunk (up to
+32,768 tokens) stays on the main card. The draft layer's rows of the prompt's last cells come back from the last card in
+the hand-off buffers (the last two chunks handed on where they came in, earlier ones past the chunk in both), so the
+smaller chunks of a deep prompt, whose KV leaves the main card fewer slots to lend, still split. With a slower tier card, a chunk short enough to be read
+routed-only with that card computing its experts' rows of it in a main-card read stays on the main card (the split would
+give that share up); with matched cards, a chunk under 4,096 tokens does. On three or more cards it runs when they all match (memory bandwidth and VRAM
+within 10%); on three or more unlike cards it is off until measured on such a set, and the start line prints what it
+would cost. Off with `--peer-exclusive`, without the RAM copy of the experts, with KV streaming, a
+control vector, experts other than NVFP4 (the price is fitted to those), when RAM or a tier's slots are short, or when a
+tier card keeps under 256 MiB free beside its stage (a read loads its kernels there; `peer-reserve-mib` sets the room).
+Everything that grows with the prompt sits in the lent slots, so a longer prompt that does not fit them is read on the
+main card. A
+prompt that arrives while other slots decode is read on the main card beside them, as before. A much shorter request
+that arrives during a read across the cards gets its turn at the end of the main card's current chunk: the main card
+reads that chunk's later layers itself and the rest of the prompt is read later, as with a main-card read.
 
 ## Two 16 GB cards
 

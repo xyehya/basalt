@@ -148,6 +148,8 @@ public:
     /// Off: the peer card's share (set_peer) is skipped, every expert of a chunk stays on this card - while the peer
     /// card runs a stage of the same prompt.
     void set_peer_share(bool on);
+    /// The longest routed-only chunk whose rows of its experts the peer computes (0: no peer share).
+    int64_t peer_routed_rows_max() const;
 
     /// The CPU expert pool (idle while a prompt is read). A chunk below stream_all_min() tokens hands it the
     /// non-resident experts with a host copy that few of its tokens route to, instead of streaming them; their rows
@@ -176,6 +178,9 @@ public:
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
+    /// Layer split, a first stage with `set_keep_last`: checked at each chunk's end (the position reached) before the
+    /// chunk is handed on; true keeps that chunk as the last one and ends the run there.
+    std::function<bool(int64_t done)> keep_here;
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
@@ -197,6 +202,10 @@ public:
     void continue_in_place() { rows_in_place_ = true; hand_in_ = nullptr; }
     /// A later stage: the hand-off buffer it read its last chunk from (pinned host, the stage before's), or null.
     const float* hand_in() const { return hand_in_; }
+    /// A stage that hands chunks on: its hand-off buffer `b` (0 or 1, pinned host, null before any), and the rows of
+    /// the full residual width each holds.  A run writes a chunk's rows at the start of one of them.
+    float* hand_buffer(int b) const;
+    int64_t hand_rows() const;
 
 
 private:
