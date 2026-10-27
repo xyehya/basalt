@@ -133,6 +133,29 @@ int main() {
         in.floor_bytes = 100 * G;
         CHECK(choose_auto(in).resident_gb == 0.0);
     }
+    // Per-request K/V placement: shallow requests stay in VRAM, deep ones go to host RAM when it holds them.
+    {
+        KvHostInputs in;
+        in.crossover_cells = 97 * 1024;
+        in.bytes_per_cell = 12963;                  // ~12.66 KB per cell
+        in.ram_available = 8 * G;
+        in.ram_kept = 5 * G;                        // 3 GiB for the pin
+        in.cells = 40 * 1024;
+        KvHostChoice c = choose_kv_host(in);
+        CHECK(!c.host && std::string(c.why) == "shallow" && c.pin_bytes == 0);
+        in.cells = 131 * 1024;                      // 1.62 GiB
+        c = choose_kv_host(in);
+        CHECK(c.host && std::string(c.why) == "host" && c.pin_bytes == (uint64_t) in.cells * in.bytes_per_cell);
+        in.cells = 262 * 1024;                      // 3.24 GiB: more than the 3 GiB left
+        c = choose_kv_host(in);
+        CHECK(!c.host && std::string(c.why) == "no RAM");
+        in.cells = (int64_t) ((3 * G) / in.bytes_per_cell);   // exactly what fits
+        CHECK(choose_kv_host(in).host);
+        in.ram_kept = 9 * G;                        // the kept RAM above what is free: no underflow
+        CHECK(!choose_kv_host(in).host);
+        in = KvHostInputs{};                        // nothing known: VRAM
+        CHECK(!choose_kv_host(in).host);
+    }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");
     return 0;

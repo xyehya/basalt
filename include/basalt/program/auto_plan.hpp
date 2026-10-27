@@ -62,6 +62,24 @@ AutoPlan choose_auto(const AutoInputs& in);
 
 const char* auto_affinity_name(AutoAffinity a);
 
+/// Where one request's K/V lives: in pinned host RAM (streamed, the VRAM tail stays expert slots) or in the elastic
+/// VRAM tail.  Decided per request, before its prompt is read.
+struct KvHostInputs {
+    int64_t cells = 0;                    ///< the cells the request can hold: prompt + new tokens + slack
+    int64_t crossover_cells = 0;          ///< below this many cells the VRAM tail is the faster place
+    uint64_t bytes_per_cell = 0;          ///< host K/V bytes per cell over every QSA layer
+    uint64_t ram_available = 0;           ///< bytes free now
+    uint64_t ram_kept = 0;                ///< bytes that stay free: the guard, the serving budget, the RAM homes
+};
+
+struct KvHostChoice {
+    bool host = false;
+    uint64_t pin_bytes = 0;               ///< what the host K/V takes when `host`
+    const char* why = "";                 ///< "shallow", "no RAM" or "host"
+};
+
+KvHostChoice choose_kv_host(const KvHostInputs& in);
+
 /// "auto flags: peer-exclusive off, resident 51.2 GB, pool-affinity all, pool-workers 15", only the auto-picked keys;
 /// empty when none was.
 std::string auto_flags_line(const AutoPlan& plan);

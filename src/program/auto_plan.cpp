@@ -75,6 +75,23 @@ AutoPlan choose_auto(const AutoInputs& in) {
     return p;
 }
 
+KvHostChoice choose_kv_host(const KvHostInputs& in) {
+    KvHostChoice c;
+    if (in.cells <= 0 || in.bytes_per_cell == 0 || in.cells < in.crossover_cells) {
+        c.why = "shallow";
+        return c;
+    }
+    const uint64_t pin = (uint64_t) in.cells * in.bytes_per_cell;
+    if (in.ram_available <= in.ram_kept || pin > in.ram_available - in.ram_kept) {
+        c.why = "no RAM";
+        return c;
+    }
+    c.host = true;
+    c.pin_bytes = pin;
+    c.why = "host";
+    return c;
+}
+
 std::string auto_flags_line(const AutoPlan& p) {
     std::string out;
     auto add = [&](const std::string& s) { out += out.empty() ? "auto flags: " : ", "; out += s; };
