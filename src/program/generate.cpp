@@ -7193,6 +7193,7 @@ int main(int argc, char** argv) {
                 !ver.drop_kv_graphs(1, e))
                 return -1;
             kv_pool.release();
+            relend();   // the prompt path's layout follows the mode (no staging pool in VRAM)
             return 1;
         };
         // set by kv_host_admit for a shallow request on a streamed session: it goes back to the VRAM tail with the cells
@@ -7249,6 +7250,7 @@ int main(int argc, char** argv) {
                 if (!basalt::core::session_kv_unmap(ss, std::min<int64_t>(std::max(kv_floor, at + kKvGrowCells), ss.max_cells), e) ||
                     !cache_regrow(e) || !ver.sync_kv_mode(e) || !ver.warm_session(&ss, e))
                     return -1;
+                relend();   // the prompt path's layout follows the mode: its loan now carries the staging pool
                 said("streamed");
                 return 1;
             }

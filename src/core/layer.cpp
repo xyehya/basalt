@@ -478,8 +478,6 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
     if (p.mode == 1) n += basalt::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
-    if (const int64_t hs = kv_host_slots(s, p, g_kv_hybrid && ring_cells <= 0))
-        n += basalt::kernels::kv_stream_map_bytes(hs) + 6 * 16;                // the map a switch to streaming uses
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
     if (!elastic) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;               // pooled
@@ -599,13 +597,15 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.map.page_table = st.page_table;
     st.map.n_blocks = pages;
     st.map.n_slots = p.slots;
+    // a switchable state's residency map is made by its switch to streaming (qsa_state_set_mode)
     st.host_slots = st.kv_arena != nullptr ? kv_host_slots(s, p, st.kv_hybrid) : 0;
-    if (const int64_t ms = p.mode == 1 ? p.slots : st.host_slots) {
-        st.map.slot_block = c.take<int32_t>((uint64_t) ms);
-        st.map.slot_stamp = c.take<int32_t>((uint64_t) ms);
-        st.map.slot_ref = c.take<int32_t>((uint64_t) ms);
-        st.map.miss_block = c.take<int32_t>((uint64_t) ms);
-        st.map.miss_slot = c.take<int32_t>((uint64_t) ms);
+    st.host_map = nullptr;
+    if (p.mode == 1) {
+        st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
+        st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);
+        st.map.slot_ref = c.take<int32_t>((uint64_t) p.slots);
+        st.map.miss_block = c.take<int32_t>((uint64_t) p.slots);
+        st.map.miss_slot = c.take<int32_t>((uint64_t) p.slots);
         st.map.ctl = c.take<int32_t>((uint64_t) basalt::kernels::kKvCtlInts);
     }
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
@@ -701,6 +701,35 @@ int64_t qsa_kv_host() { return g_kv_host; }
 namespace {
 // The K/V arrays of a state's arena (the rest are the pooled keys and the rope rows)
 size_t kv_arrays(const QsaState& st) { return st.kv_q4 ? 2 : st.kv_int8 ? 4 : 2; }
+
+// A switchable state's residency map, in VRAM only while it streams
+bool host_map_make(QsaState& st) {
+    if (st.host_map != nullptr) return true;
+    const int64_t n = st.host_slots;
+    void* d = nullptr;
+    if (cudaMalloc(&d, (size_t) basalt::kernels::kv_stream_map_bytes(n) + 6 * 16) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    st.host_map = d;
+    Cursor c{(uint8_t*) d};
+    st.map.slot_block = c.take<int32_t>((uint64_t) n);
+    st.map.slot_stamp = c.take<int32_t>((uint64_t) n);
+    st.map.slot_ref = c.take<int32_t>((uint64_t) n);
+    st.map.miss_block = c.take<int32_t>((uint64_t) n);
+    st.map.miss_slot = c.take<int32_t>((uint64_t) n);
+    st.map.ctl = c.take<int32_t>((uint64_t) basalt::kernels::kKvCtlInts);
+    return true;
+}
+
+// Frees it; `stream` is synchronized first (its queued work may still use the map).
+void host_map_free(QsaState& st, void* stream) {
+    if (st.host_map == nullptr) return;
+    (void) cudaStreamSynchronize((cudaStream_t) stream);
+    (void) cudaFree(st.host_map);
+    st.host_map = nullptr;
+    st.map.slot_block = st.map.slot_stamp = st.map.slot_ref = st.map.miss_block = st.map.miss_slot = st.map.ctl = nullptr;
+}
 }  // namespace
 
 uint64_t qsa_kv_host_layer_bytes(const QsaState& st, const ModelGeometry& g, int64_t cells) {
@@ -740,7 +769,7 @@ void qsa_state_kv_cap(QsaState& st, bool capped) {
 bool qsa_state_set_mode(QsaState& st, const ModelGeometry& g, int mode, const basalt::kernels::KvHostPools& host,
                         int64_t host_cells, int64_t live_cells, void* stream, std::string& err) {
     const QsaShapes s = qsa_shapes(g);
-    if (st.kv_arena == nullptr || st.host_slots <= 0 || st.map.slot_block == nullptr || st.kv_hybrid ||
+    if (st.kv_arena == nullptr || st.host_slots <= 0 || st.kv_hybrid ||
         (st.kv_mode != 0 && st.kv_mode != 1) || (mode != 0 && mode != 1)) {
         err = "KV mode switch: the state cannot stream (not elastic, no residency map, or a hybrid K8V4 layout)";
         return false;
@@ -761,6 +790,10 @@ bool qsa_state_set_mode(QsaState& st, const ModelGeometry& g, int mode, const ba
         if (st.kv_mode == 0) {
             if (st.kv_arena->cells() < std::min(live_pages * s.page_size, st.kv_arena->max_cells())) {
                 err = "KV mode switch: the live cells are not backed";
+                return false;
+            }
+            if (!host_map_make(st)) {
+                err = "KV mode switch: no VRAM for the residency map";
                 return false;
             }
             basalt::kernels::kv_unstage_to_host(vram, host, fmt, 0, live_pages, s, stream);
@@ -790,6 +823,7 @@ bool qsa_state_set_mode(QsaState& st, const ModelGeometry& g, int mode, const ba
         st.host = basalt::kernels::KvHostPools{};
         st.host_cells = 0;
         basalt::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_pages, stream);   // the identity
+        host_map_free(st, stream);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -800,6 +834,7 @@ bool qsa_state_set_mode(QsaState& st, const ModelGeometry& g, int mode, const ba
 }
 
 void qsa_state_release(QsaState& st) {
+    host_map_free(st, nullptr);
     delete st.kv_arena;
     st.kv_arena = nullptr;
 }

@@ -234,6 +234,7 @@ struct QsaState {
     /// An elastic state that can switch to streaming in place (qsa_set_kv_host): the VRAM pages its slot pool keeps
     /// then, the first pages of its K/V arrays; 0: it cannot.
     int64_t host_slots = 0;
+    void* host_map = nullptr;        ///< the residency map's VRAM while a switchable state streams (owned)
     basalt::kernels::KvHostPools host;
     int64_t host_cells = 0;          ///< the cells `host` holds (whole pages)
     basalt::kernels::KvStreamMap map;

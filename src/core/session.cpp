@@ -189,7 +189,7 @@ bool session_kv_can_stream(const SessionState& s) {
     if (s.qsa_states == nullptr || s.qsa_alloc <= 0) return false;
     for (int64_t j = 0; j < s.qsa_alloc; ++j) {
         const QsaState& st = s.qsa_states[s.qsa_ord0 + j];
-        if (st.host_slots <= 0 || st.kv_arena == nullptr || st.map.slot_block == nullptr) return false;
+        if (st.host_slots <= 0 || st.kv_arena == nullptr) return false;
     }
     return true;
 }

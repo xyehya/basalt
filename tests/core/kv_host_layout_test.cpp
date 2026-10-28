@@ -23,7 +23,6 @@ static int g_fail = 0;
 int main() {
     const c::ModelGeometry g{};
     const int64_t ctx = 262144, floor = 32768;
-    const uint64_t map_bytes = k::kv_stream_map_bytes(floor / 4) + 6 * 16;
     for (const char* kv : {"int8", "fp16", "q4_0"}) {
         c::qsa_set_kv_int8(std::string(kv) == "int8");
         c::qsa_set_kv_q4(std::string(kv) == "q4_0");
@@ -37,15 +36,11 @@ int main() {
         c::qsa_set_kv_elastic(0);
         c::qsa_set_kv_host(floor);
         CHECK(c::qsa_state_bytes(g, ctx) == whole);
-        // on: the residency map of the floor's pages, nothing else
+        // on: nothing more in the session (the residency map is made by the switch to streaming)
         c::qsa_set_kv_elastic(floor);
-        const uint64_t at_floor = c::qsa_state_bytes(g, ctx);
-        CHECK(at_floor - elastic == map_bytes);
-        CHECK(c::qsa_state_bytes(g, ctx, false) - elastic_rest == map_bytes);
-        // a pool above the floor stays at the floor; one below the fewest resident cells cannot stream
+        CHECK(c::qsa_state_bytes(g, ctx) == elastic);
+        CHECK(c::qsa_state_bytes(g, ctx, false) == elastic_rest);
         c::qsa_set_kv_host(4 * floor);
-        CHECK(c::qsa_state_bytes(g, ctx) == at_floor);
-        c::qsa_set_kv_host(c::qsa_kv_resident_min() - 4);
         CHECK(c::qsa_state_bytes(g, ctx) == elastic);
         c::qsa_set_kv_host(0);
         c::qsa_set_kv_elastic(0);
