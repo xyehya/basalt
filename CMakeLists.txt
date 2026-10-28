@@ -306,7 +306,7 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
 # about arithmetic, and this one knows the ORDER the arithmetic happens in.
 add_library(engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
   src/core/remote_expert_opt.cu
-  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+  src/core/expert_cache.cpp src/core/vmm.cpp src/core/kv_arena.cpp src/core/kv_host_pool.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
   src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp src/core/staged_copy.cpp)
 target_include_directories(engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(engine PUBLIC core kernels kernels_cpu ${_gpu_runtime_target})
@@ -409,6 +409,11 @@ if(BUILD_TESTING)
   target_link_libraries(kv_arena_test PRIVATE engine)
   basalt_gpu_test(NAME kv_arena_test COMMAND kv_arena_test)
   set_tests_properties(kv_arena_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  # one elastic QSA state switched between whole-in-VRAM and streamed in place, vs a resident state (bitwise)
+  add_executable(kv_mode_switch_test tests/core/kv_mode_switch_test.cpp)
+  target_link_libraries(kv_mode_switch_test PRIVATE engine)
+  basalt_gpu_test(NAME kv_mode_switch_test COMMAND kv_mode_switch_test)
+  set_tests_properties(kv_mode_switch_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 
 # `basalt` (generate.cpp): the engine program that composes the components into a token.  The prompt arrives as
