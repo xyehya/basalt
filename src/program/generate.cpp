@@ -4365,11 +4365,12 @@ int main(int argc, char** argv) {
             else stage_lent_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(pr.first);
         }
     }
-    // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
-    // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-    // (exp kv_tail_copies=0: the tail keeps no copies; the experts the prompt's loan then reaches without a copy take
-    // a RAM home at the request's admission)
-    const bool kv_tail_copies = basalt::core::exp_flag("kv_tail_copies", 1) != 0;
+    // The RAM copies cover the prompt path's lend region: the RAM decides how far down that goes.  The elastic KV
+    // moves that region down as it takes the cache's tail, and the experts it then reaches without a copy take a RAM
+    // home at the request's admission (home_given_up), given back when the cache grows again; so the copies do not
+    // also cover the region's lowest reach.  --batch keeps them (its slots' prompts lend while others decode).
+    // exp kv_tail_copies=1: copies for the region's lowest reach too, no homes.
+    const bool kv_tail_copies = basalt::core::exp_flag("kv_tail_copies", o.batch > 0 ? 1 : 0) != 0;
     if (kv_tail_slots > 0 && kv_tail_copies)
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
     // a swap takes a free place only for an evicted expert with no RAM copy: the slots below the lend region keep none,
