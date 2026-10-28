@@ -2637,7 +2637,7 @@ int main(int argc, char** argv) {
                              o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
     // ---- THE PER-REQUEST HOST K/V (on by default; --exp kv_host=0 turns it off): the solo session's elastic states can
-    // also stream, a slot pool of the floor's pages in VRAM and the request's K/V in a pinned host pool; each request is
+    // also stream, a slot pool of kKvHostSlotCells in VRAM and the request's K/V in a pinned host pool; each request is
     // admitted to one mode (kv_host_admit below).  One GPU, one request at a time, INT8/FP16/Q4_0 K/V.  Where it cannot
     // apply every request keeps its K/V in VRAM, said only when kv_host=1 asked for it.
     const int kv_host_exp = (int) basalt::core::exp_flag("kv_host", -1);
@@ -2650,7 +2650,9 @@ int main(int argc, char** argv) {
                             : nullptr;
     if (kv_host_off != nullptr && kv_host_forced) basalt::log::warn("basalt generate", "host K/V is off: %s", kv_host_off);
     const bool kv_host_on = kv_host_off == nullptr;
-    basalt::core::qsa_set_kv_host(kv_host_on ? kv_floor : 0);
+    // the slot pool's cells: the K/V arrays' first pages, backed while the session streams (kv_keep_cells)
+    constexpr int64_t kKvHostSlotCells = 32768;
+    basalt::core::qsa_set_kv_host(kv_host_on ? kKvHostSlotCells : 0);
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
@@ -7102,11 +7104,15 @@ int main(int argc, char** argv) {
         // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
         // cache's last slots) - false with `e` empty when that is not enough
         // `min_cells`: when `cells` would take the cache below its floor, as many as leave it, down to these
+        // the cells a session never goes below: the floor, and while it streams its slot pool (the capped K/V arrays)
+        auto kv_keep_cells = [&](const basalt::core::SessionState& s) -> int64_t {
+            return basalt::core::session_kv_mode(s) == 1 ? std::max(kv_floor, kKvHostSlotCells) : kv_floor;
+        };
         auto kv_fit = [&](basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink = true,
                           int64_t min_cells = -1) -> bool {
             kv_short = false;
             if (kv_floor <= 0) return true;
-            cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
+            cells = std::min<int64_t>(std::max<int64_t>(cells, kv_keep_cells(s)), s.max_cells);
             int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
             if (add <= 0) return true;
             const auto t0 = Clock::now();
@@ -7176,7 +7182,7 @@ int main(int argc, char** argv) {
         };
         auto kv_release = [&](basalt::core::SessionState& s, int64_t cells, std::string& e) -> bool {
             if (kv_floor <= 0) return true;
-            cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
+            cells = std::min<int64_t>(std::max<int64_t>(cells, kv_keep_cells(s)), s.max_cells);
             if (basalt::core::session_kv_bytes_for(s, basalt::core::session_kv_cells(s)) <=
                 basalt::core::session_kv_bytes_for(s, cells)) return true;
             const auto t0 = Clock::now();
@@ -7220,7 +7226,7 @@ int main(int argc, char** argv) {
         };
         if (kv_host_live)
             basalt::log::info("basalt serve", "host K/V: on, %lld-cell slot pool, streamed from %lld cells, %.2f GiB of RAM "
-                                 "kept free", (long long) kv_floor, (long long) kv_host_cross,
+                                 "kept free", (long long) kKvHostSlotCells, (long long) kv_host_cross,
                          (double) kv_host_kept() / 1073741824.0);
         basalt::core::KvHostPool kv_pool;
         // the output cells a pool is pinned for, and its slack (no more than one page of output); a request that writes
@@ -7331,6 +7337,12 @@ int main(int argc, char** argv) {
                 return 1;
             case basalt::program::KvHostAct::take: {
                 if (!kv_drain(e)) return -1;
+                // the slot pool's pages backed before the switch caps the K/V arrays at them
+                if (!kv_fit(ss, kKvHostSlotCells, pe)) {
+                    if (!kv_short) { e = pe; return -1; }
+                    basalt::log::warn("basalt serve", "host K/V: %s; the request keeps its K/V in VRAM", pe.c_str());
+                    return 1;
+                }
                 const uint64_t homes0 = src.homes_bytes();
                 if (!kv_pool.reserve(ss, g, plan.cells, pe) ||
                     !basalt::core::session_kv_set_mode(ss, g, 1, &kv_pool, live_c, nullptr, pe)) {

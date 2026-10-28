@@ -294,7 +294,7 @@ int64_t qsa_kv_elastic();
 /// Frees a state's elastic KV (no-op without one).
 void qsa_state_release(QsaState& st);
 /// Per-request host K/V: elastic states initialized while `slot_cells` > 0 also carve a residency map of
-/// `slot_cells` cells (whole pages, at most the elastic floor, so the slots stay backed), so qsa_state_set_mode can
+/// `slot_cells` cells (whole pages; the caller keeps them backed while the state streams), so qsa_state_set_mode can
 /// switch them between whole-in-VRAM and streamed between requests; 0 turns it off.  A pool smaller than
 /// qsa_kv_resident_min() leaves the states unable to stream.
 void qsa_set_kv_host(int64_t slot_cells);

@@ -8,7 +8,8 @@
 //   2. while streamed, the K/V arrays stay at the slot pool's pages (the depth follows only in the pooled keys);
 //   3. after the switch back, the VRAM K/V of every live cell equals the reference's;
 //   4. a conversation snapshot taken in mode 1 equals one taken in mode 0 at the same depth, and restores into mode 1.
-// INT8, FP16 and Q4_0.  Exits 77 without a CUDA device or virtual memory management.
+// INT8, FP16 and Q4_0, with the elastic floor at the slot pool and below it.  Exits 77 without a CUDA device or virtual
+// memory management.
 #include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/core/kv_arena.hpp"
 #include "basalt/core/kv_host_pool.hpp"
@@ -80,30 +81,31 @@ bool same_device(const void* a, const void* b, size_t n) {
     return std::memcmp(x.data(), y.data(), n) == 0;
 }
 
-int run(int fmt) {
+int run(int fmt, int64_t floor) {
     const char* name = fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
+    std::printf("  %s, elastic floor %lld cells:\n", name, (long long) floor);
     c::qsa_set_kv_int8(fmt == k::kKvInt8);
     c::qsa_set_kv_q4(fmt == k::kKvQ4);
     const c::ModelGeometry g{};
     k::QsaShapes s = k::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
-    const int64_t max_cells = 65536, floor = 32768, N = 60000, switch_at = 20000, grow_at = 36000, back_at = 48000;
+    const int64_t max_cells = 65536, slot = 32768, N = 60000, switch_at = 20000, grow_at = 36000, back_at = 48000;
     // the plain reference: whole in VRAM, identity table
     c::qsa_set_kv_elastic(0);
     c::qsa_set_kv_host(0);
     c::QsaState ref;
     void* rb = dalloc<uint8_t>(c::qsa_state_bytes(g, max_cells));
     if (c::qsa_state_init(g, max_cells, rb, ref) == 0) { std::fprintf(stderr, "reference init failed\n"); return 1; }
-    // the switchable state: elastic, a slot pool of the floor's cells
+    // the switchable state: elastic, a slot pool of `slot` cells
     c::qsa_set_kv_elastic(floor);
-    c::qsa_set_kv_host(floor);
+    c::qsa_set_kv_host(slot);
     c::QsaState st;
     void* sb = dalloc<uint8_t>(c::qsa_state_bytes(g, max_cells));
     const uint64_t used = c::qsa_state_init(g, max_cells, sb, st);
     c::qsa_set_kv_elastic(0);
     c::qsa_set_kv_host(0);
-    if (used == 0 || st.kv_arena == nullptr || st.host_slots != floor / s.page_size) {
+    if (used == 0 || st.kv_arena == nullptr || st.host_slots != slot / s.page_size) {
         std::fprintf(stderr, "%s: switchable init failed (arena %p, host slots %lld)\n", name, (void*) st.kv_arena,
                      (long long) st.host_slots);
         return 1;
@@ -136,9 +138,10 @@ int run(int fmt) {
     const uint64_t page_kv = k::kv_block_bytes(s, fmt);
 
     for (int64_t pos = 0; pos < N; ++pos) {
-        if (pos == switch_at) {   // 0 -> 1: a host pool for the request's cells, the VRAM K/V past the slots given back
-            if (!pool.reserve(ss, g, grow_at + 64, err) ||
-                !c::session_kv_set_mode(ss, g, 1, &pool, pos, nullptr, err) || !st.kv_arena->unmap(floor, err)) {
+        if (pos == switch_at) {   // 0 -> 1: the slot pages backed, a host pool for the request's cells, the VRAM K/V past
+                                  // the slots given back
+            if (!st.kv_arena->map(slot, err) || !pool.reserve(ss, g, grow_at + 64, err) ||
+                !c::session_kv_set_mode(ss, g, 1, &pool, pos, nullptr, err) || !st.kv_arena->unmap(slot, err)) {
                 std::fprintf(stderr, "%s: switch to 1 at %lld: %s\n", name, (long long) pos, err.c_str());
                 return 1;
             }
@@ -295,7 +298,8 @@ int main() {
     if (!c::vmm::supported()) { std::puts("no virtual memory management: skipped"); return 77; }
     std::printf("kv_mode_switch_test: one elastic state, mode 0 -> 1 -> 1 (larger pool) -> 0 -> 1, vs a resident state\n");
     int bad = 0;
-    for (int fmt : {k::kKvInt8, k::kKvF16, k::kKvQ4}) bad += run(fmt);
+    for (int64_t floor : {32768, 8192})
+        for (int fmt : {k::kKvInt8, k::kKvF16, k::kKvQ4}) bad += run(fmt, floor);
     std::printf(bad ? "FAIL\n" : "PASS\n");
     return bad ? 1 : 0;
 }
