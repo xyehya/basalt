@@ -8627,8 +8627,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             // the tail without RAM copies: the loan follows the cache's end down as the KV grows, so the experts it
-            // reaches that have no RAM copy take a home before the prompt is read (none to take: nothing is copied)
-            if (!kv_tail_copies && kv_floor > 0 && !in_slot) {
+            // reaches below the copies' region take a home before the prompt is read
+            int64_t loan_chunk = 0;
+            if (!kv_tail_copies && kv_floor > 0 && !in_slot && lend_from > 0 && !pf_parts.empty() &&
+                pf_parts[0].first >= 0 && loan_plan(xcache.slots(), loan_chunk) < lend_from) {
                 if (!kv_drain(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
