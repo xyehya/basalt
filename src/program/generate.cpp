@@ -7154,6 +7154,13 @@ int main(int argc, char** argv) {
             std::string pe;
             switch (plan.act) {
             case basalt::program::KvHostAct::none:
+                // a deep request whose pin does not fit: said, since it decodes from the VRAM tail
+                if (std::strcmp(plan.why, "no RAM") == 0)
+                    basalt::log::info("basalt serve", "host K/V: kept in VRAM (no RAM), %lld cells need %.2f GiB pinned, "
+                                         "%.2f GiB free, %.2f GiB kept free", (long long) cells,
+                                 (double) ((uint64_t) cells * in.bytes_per_cell) / 1073741824.0,
+                                 (double) in.ram_available / 1073741824.0, (double) in.ram_kept / 1073741824.0);
+                return 1;
             case basalt::program::KvHostAct::keep:
                 return 1;
             case basalt::program::KvHostAct::take: {
