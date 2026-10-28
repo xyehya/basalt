@@ -105,6 +105,10 @@ int64_t kv_host_cells(int64_t need, int64_t max_new, int64_t slack, int64_t grid
 KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells) {
     KvHostPlan p;
     const bool deep = in.cells > 0 && in.bytes_per_cell > 0 && in.cells >= in.crossover_cells;
+    if (pool_cells <= 0 && deep && in.fresh_cells > 0 && in.read_cells > in.fresh_cells) {
+        p.why = "fresh";
+        return p;
+    }
     if (pool_cells > 0 && deep && pool_cells >= in.cells && !in.ram_low) {
         p.host = true;
         p.act = KvHostAct::keep;

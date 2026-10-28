@@ -7220,7 +7220,11 @@ int main(int argc, char** argv) {
         // set by kv_host_admit for a shallow request on a streamed session: it goes back to the VRAM tail with the cells
         // it keeps once the outgoing conversation is parked (kv_host_back)
         bool kv_host_late = false;
-        auto kv_host_admit = [&](int64_t need, int64_t new_tokens, int64_t live_cells, std::string& e) -> int {
+        // a session not streamed yet takes a pool only for a request that reads at most this many prompt tokens: a long
+        // streamed read costs more than its decode wins back, and the conversation's next turn (a short read) streams
+        const int64_t kv_host_fresh = (int64_t) basalt::core::exp_flag("kv_host_fresh", 32768);
+        auto kv_host_admit = [&](int64_t need, int64_t new_tokens, int64_t live_cells, int64_t read,
+                                 std::string& e) -> int {
             kv_host_late = false;
             if (!kv_host_live) return 1;
             const int64_t live_c = std::min<int64_t>(std::max<int64_t>(live_cells, 0), ss.max_cells);
@@ -7239,6 +7243,8 @@ int main(int argc, char** argv) {
             in.ram_available = kv_ram_now();
             in.ram_kept = kv_host_kept();
             in.ram_low = basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok;
+            in.read_cells = std::max<int64_t>(read, 0);
+            in.fresh_cells = std::max<int64_t>(kv_host_fresh, 0);
             const basalt::program::KvHostPlan plan = basalt::program::plan_kv_host(in, kv_pool.valid() ? kv_pool.cells() : 0);
             const auto t0 = Clock::now();
             auto said = [&](const char* what) {
@@ -7252,6 +7258,10 @@ int main(int argc, char** argv) {
             switch (plan.act) {
             case basalt::program::KvHostAct::none:
                 // a deep request whose pin does not fit: said, since it decodes from the VRAM tail
+                if (std::strcmp(plan.why, "fresh") == 0)
+                    basalt::log::info("basalt serve", "host K/V: kept in VRAM (a %lld-token prompt read), %lld cells; a "
+                                         "later turn that reads at most %lld streams", (long long) in.read_cells,
+                                 (long long) cells, (long long) in.fresh_cells);
                 if (std::strcmp(plan.why, "no RAM") == 0)
                     basalt::log::info("basalt serve", "host K/V: kept in VRAM (no RAM), %lld cells need %.2f GiB pinned, "
                                          "%.2f GiB free, %.2f GiB kept free", (long long) cells,
@@ -8899,7 +8909,8 @@ int main(int argc, char** argv) {
             int64_t kv_live = (int64_t) live.size();
             for (const ConvCheckpoint& c : checks) kv_live = std::max<int64_t>(kv_live, (int64_t) c.ids.size());
             kv_host_late = false;
-            if (const int adm = in_slot ? 1 : kv_host_admit(kv_need, max_new, kv_live, err); adm <= 0) {
+            const int64_t kv_read = n - (incoming ? (int64_t) parked.tokens : resume);   // the prompt tokens it reads
+            if (const int adm = in_slot ? 1 : kv_host_admit(kv_need, max_new, kv_live, kv_read, err); adm <= 0) {
                 if (adm < 0) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;

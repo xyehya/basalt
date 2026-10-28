@@ -36,7 +36,9 @@ the cells they do not hold, is refused with that error, and a reply that grows p
 slot ends as at its length limit); the engine keeps running.
 
 A request that starts decoding at 99328 tokens or deeper keeps its K/V in pinned RAM instead (the host K/V): attention
-reads it through a VRAM pool of 32768 cells, so the cache keeps its tail slots. The pin covers the
+reads it through a VRAM pool of 32768 cells, so the cache keeps its tail slots. A conversation switches at a turn that
+reads at most 32768 new prompt tokens (a continuation); a turn that reads a longer prompt stays in VRAM, since a long
+streamed read costs more than its decode wins back, and the conversation's next turn switches. The pin covers the
 prompt, up to 16384 new tokens and 4096 more, on a 16384-cell grid; a reply that outgrows it gets a pool for its next
 16384 tokens between two decode windows, or goes back to the VRAM tail when the RAM is short. The next shallower
 request goes back to the VRAM tail too, and so does a streamed session when a request arrives with the RAM below the

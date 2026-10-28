@@ -227,6 +227,32 @@ int main() {
         CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "no RAM");
         CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
     }
+    {   // a deep request that reads a long fresh prompt stays in the VRAM tail; a short read (a continuation) streams,
+        // and a session already streamed keeps streaming whatever it reads
+        KvHostInputs in;
+        in.crossover_cells = 99328;
+        in.cells = 147456;
+        in.bytes_per_cell = 12963;
+        in.ram_available = 9 * G;
+        in.ram_kept = 5 * G;
+        in.fresh_cells = 32768;
+        in.read_cells = 131072;
+        KvHostPlan p = plan_kv_host(in, 0);
+        CHECK(!p.host && p.act == KvHostAct::none && std::string(p.why) == "fresh");
+        in.read_cells = 2000;
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        in.read_cells = 32768;
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        in.read_cells = 131072;
+        CHECK(plan_kv_host(in, 163840).act == KvHostAct::keep);
+        in.cells = 180224;                          // deeper than the pool held: a larger one, not the VRAM tail
+        CHECK(plan_kv_host(in, 163840).act == KvHostAct::grow);
+        in.cells = 40960;                           // shallow: as before
+        CHECK(std::string(plan_kv_host(in, 0).why) == "shallow");
+        in.cells = 147456;
+        in.fresh_cells = 0;                         // no limit
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+    }
     {   // a pool that cannot grow still serves a request when it holds the prompt and the next decode window
         CHECK(kv_host_pool_serves(131072, 120000, 2112));
         CHECK(kv_host_pool_serves(131072, 128960, 2112));

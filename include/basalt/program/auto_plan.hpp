@@ -71,6 +71,9 @@ struct KvHostInputs {
     uint64_t ram_available = 0;           ///< bytes free now
     uint64_t ram_kept = 0;                ///< bytes that stay free beside the pin (kv_host_keep)
     bool ram_low = false;                 ///< the RAM guard is below its floor: a pool held is given back, not kept
+    int64_t read_cells = 0;               ///< the prompt cells the request reads (the rest it reuses)
+    int64_t fresh_cells = 0;              ///< a session not streamed yet takes a pool only for a request that reads at
+                                          ///< most this many (0: any): a long streamed read costs more than it gains
 };
 
 /// The RAM a pin leaves free beside it: the guard's floor and what serving can still take, i.e. its budget less what
@@ -80,7 +83,7 @@ uint64_t kv_host_keep(uint64_t guard_floor, uint64_t serve_budget, uint64_t serv
 struct KvHostChoice {
     bool host = false;
     uint64_t pin_bytes = 0;               ///< what the host K/V takes when `host`
-    const char* why = "";                 ///< "shallow", "no RAM" or "host"
+    const char* why = "";                 ///< "shallow", "fresh", "no RAM" or "host"
 };
 
 KvHostChoice choose_kv_host(const KvHostInputs& in);
