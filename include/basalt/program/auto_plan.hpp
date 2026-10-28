@@ -70,8 +70,6 @@ struct KvHostInputs {
     uint64_t bytes_per_cell = 0;          ///< host K/V bytes per cell over every QSA layer
     uint64_t ram_available = 0;           ///< bytes free now
     uint64_t ram_kept = 0;                ///< bytes that stay free beside the pin (kv_host_keep)
-    uint64_t ram_back = 0;                ///< bytes a take may give back once the pin is taken (the RAM homes it can free)
-    uint64_t ram_floor = 0;               ///< bytes that stay free while the pin is taken, before `ram_back` returns
     bool ram_low = false;                 ///< the RAM guard is below its floor: a pool held is given back, not kept
     int64_t read_cells = 0;               ///< the prompt cells the request reads (the rest it reuses)
     int64_t fresh_cells = 0;              ///< a session not streamed yet takes a pool only for a request that reads at
@@ -113,8 +111,7 @@ struct KvHostPlan {
 };
 
 /// `pool_cells`: the cells of the pool the session holds now (0: none, the session is in the VRAM tail).  A pool that
-/// covers a deep request is kept (it is pinned already) unless `ram_low`; a larger one must fit beside it, with no
-/// `ram_back` (only a take gives RAM homes back).
+/// covers a deep request is kept (it is pinned already) unless `ram_low`; a larger one must fit beside it.
 KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells);
 /// Whether a pool of `pool_cells` can still serve a request that starts decoding at `at` cells: its prompt and the
 /// next decode window (`window` cells); the output past it grows the pool between windows or stops the request.
