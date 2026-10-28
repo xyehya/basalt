@@ -4365,10 +4365,20 @@ int main(int argc, char** argv) {
             else stage_lent_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(pr.first);
         }
     }
-    // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
-    // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-    if (kv_tail_slots > 0)
+    // The RAM copies cover the prompt path's lend region: the RAM decides how far down that goes.  The elastic KV
+    // moves that region down as it takes the cache's tail, and the experts it then reaches without a copy take a RAM
+    // home at the request's admission (home_given_up), given back when the cache grows again; so the copies do not
+    // also cover the region's lowest reach.  --batch keeps them (its slots' prompts lend while others decode).
+    // exp kv_tail_copies=1: copies for the region's lowest reach too, no homes.
+    const bool kv_tail_copies = basalt::core::exp_flag("kv_tail_copies", o.batch > 0 ? 1 : 0) != 0;
+    if (kv_tail_slots > 0 && kv_tail_copies)
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
+    // a swap takes a free place only for an evicted expert with no RAM copy: the slots below the lend region keep none,
+    // so the places follow their share of the cache
+    auto spare_places = [&](int64_t full) -> int64_t {
+        if (lend_from < 0 || xcache.slots() <= 0) return full;
+        return (full * lend_from + xcache.slots() - 1) / xcache.slots();
+    };
     // ---- the start-up picks for the settings the user left out (peer-exclusive, resident RAM, pool affinity and
     // size): one pure rule over what this machine and pack have, so a given setting is never replaced.  The pool is
     // built here, with the picks.
@@ -4398,7 +4408,7 @@ int main(int argc, char** argv) {
         in.complement_peer_excl = in.complement_full - std::min(in.complement_full, peer_expert_room());
         // the RAM copy also holds the free places the adaptive swaps use (see set_spares)
         const uint64_t blob = basalt::kernels::cpu::expert_layout().max_blob;
-        const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
+        const uint64_t spares_full = adapt_fast_on ? (uint64_t) spare_places(o.adapt_swaps * kSatBoost) * blob : 0;
         const uint64_t spares_excl =
             adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
         in.complement_full += lent_bytes + spares_full;
@@ -4487,7 +4497,7 @@ int main(int argc, char** argv) {
         // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)
-                                            : o.adapt_swaps * kSatBoost);
+                                            : spare_places(o.adapt_swaps * kSatBoost));
         uint64_t resident_headroom = resident_headroom_base;
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
@@ -4543,7 +4553,7 @@ int main(int argc, char** argv) {
             // Allow the backed slots plus a fixed amount of file reading per prompt.  Those reads are evictable page
             // cache that the refill passes through once, so two chunks' worth are funded; the read-time cap
             // (kMaxAutoChunk) bounds the chunk, so the ceiling stops there too.
-            const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - kv_tail_slots) +
+            const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - (kv_tail_copies ? kv_tail_slots : 0)) +
                                   (int64_t) (2 * basalt::platform::kPromptFileReadBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
             auto_ceiling = std::max<int64_t>(8192, engine_local::biggest_chunk(std::min<int64_t>(auto_ceiling, kMaxAutoChunk),
                                                                  [&](int64_t t) { return serve_loans::lend_slots(xcache, g, ss, t) <= allow; }));
@@ -6984,6 +6994,19 @@ int main(int argc, char** argv) {
             if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
             res_upload();
             relend();
+            // the tail without RAM copies: the experts in slots below the loan again give their RAM homes back
+            if (!kv_tail_copies && src.complement_ready() && src.homes_bytes() > 0) {
+                const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+                size_t released = 0;
+                for (size_t j = 0; j < host_res.size(); ++j)
+                    if (host_res[j] >= 0 && host_res[j] < loan_from &&
+                        src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                        ++released;
+                const uint64_t freed = released > 0 ? src.homes_reclaim() + src.homes_compact() : 0;
+                if (released > 0)
+                    basalt::log::info("basalt serve", "elastic KV: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept",
+                                      released, (double) freed / 1048576.0, (double) src.homes_bytes() / 1048576.0);
+            }
             return true;
         };
         // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
@@ -8656,6 +8679,20 @@ int main(int argc, char** argv) {
             if (!kv_ok) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            // the tail without RAM copies: the loan follows the cache's end down as the KV grows, so the experts it
+            // reaches below the copies' region take a home before the prompt is read
+            int64_t loan_chunk = 0;
+            if (!kv_tail_copies && kv_floor > 0 && !in_slot && lend_from > 0 && !pf_parts.empty() &&
+                pf_parts[0].first >= 0 && loan_plan(xcache.slots(), loan_chunk) < lend_from) {
+                if (!kv_drain(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                std::string he;
+                if (!home_given_up(xcache.slots(), he))
+                    basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
+                                         "the prompt reads them from the file", he.c_str());
             }
             if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
