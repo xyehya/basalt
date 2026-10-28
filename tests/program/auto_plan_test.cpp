@@ -205,30 +205,13 @@ int main() {
         in.bytes_per_cell = (uint64_t) (1.93 * (double) G) / (uint64_t) in.cells;
         in.ram_available = (uint64_t) (6.63 * (double) G);
         const uint64_t guard = (uint64_t) (3.09 * (double) G), budget = (uint64_t) (2.13 * (double) G);
-        in.ram_floor = guard + 256 * M;
         in.ram_kept = kv_host_keep(guard, budget, 0);
         CHECK(plan_kv_host(in, 0).act == KvHostAct::none);       // the whole budget kept: stays in VRAM
         in.ram_kept = kv_host_keep(guard, budget, 600 * M);      // 600 MiB of it already held
         CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
-        in.ram_kept = kv_host_keep(guard, budget, 0);
-        in.ram_back = 600 * M;                                   // the homes the take frees
-        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
-        in.ram_back = 400 * M;                                   // not enough of them
+        in.ram_kept = kv_host_keep(guard, budget, 400 * M);      // not enough of it held
         CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
-        // a larger pool beside the one held gets no homes back
-        in.ram_back = 600 * M;
-        CHECK(plan_kv_host(in, 98304).act == KvHostAct::drop);
-        // the floor while the pin is taken holds whatever comes back after
-        in.ram_back = 4 * G;
-        in.ram_available = guard + 256 * M + (uint64_t) in.cells * in.bytes_per_cell - 1;
-        CHECK(!choose_kv_host(in).host && std::string(choose_kv_host(in).why) == "no RAM");
-        in.ram_available += 1;
-        CHECK(choose_kv_host(in).host);
-        in.ram_floor = 0;                                        // no floor: the kept RAM alone
-        in.ram_available = 1 * G;
-        in.ram_kept = 0;
-        in.ram_back = 0;
-        CHECK(!choose_kv_host(in).host);
+        CHECK(plan_kv_host(in, 98304).act == KvHostAct::drop);   // nor for a larger pool beside the one held
     }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");
