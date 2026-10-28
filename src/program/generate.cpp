@@ -7151,8 +7151,8 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 basalt::log::warn("basalt serve", "host K/V: a larger pool: %s; back to VRAM", pe.c_str());
-                [[fallthrough]];
             }
+                [[fallthrough]];
             case basalt::program::KvHostAct::drop: {
                 if (!kv_drain(e)) return -1;
                 // the K/V arrays back the live cells and the request's again (out of the expert cache), then the cells
