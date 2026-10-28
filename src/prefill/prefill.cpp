@@ -584,11 +584,12 @@ struct Prefill::Impl {
 };
 
 namespace {
-// the staging pool of a streamed session: every page of one layer (same sequence in init and bytes_needed)
+// the staging pool of a streamed session, or of one that can switch to streaming between requests (its loans are
+// then sized the same in both modes): every page of one layer (same sequence in init and bytes_needed)
 void take_stage(Alloc& o, const core::SessionState& ss, const basalt::kernels::QsaShapes& s,
                 basalt::kernels::KvHostPools& st, bool& ok) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
-    if (q0.kv_mode != 1) return;
+    if (q0.kv_mode != 1 && q0.host_slots <= 0) return;
     const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
     if (q0.kv_q4) {
         st.k_q4 = o.take<uint8_t>(rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
@@ -947,7 +948,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         for (int b = 0; b < 2; ++b) m.ahead_slot[b].assign((size_t) m.g->n_expert, -1);
     }
-    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
+    // KV streaming (now, or after a switch between requests): the staging pool's identity page table
+    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1 || ss.qsa_states[ss.qsa_primary()].host_slots > 0) {
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
