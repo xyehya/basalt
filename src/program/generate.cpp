@@ -4365,10 +4365,20 @@ int main(int argc, char** argv) {
             else stage_lent_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(pr.first);
         }
     }
-    // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
-    // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-    if (kv_tail_slots > 0)
+    // The RAM copies cover the prompt path's lend region: the RAM decides how far down that goes.  The elastic KV
+    // moves that region down as it takes the cache's tail, and the experts it then reaches without a copy take a RAM
+    // home at the request's admission (home_given_up), given back when the cache grows again; so the copies do not
+    // also cover the region's lowest reach.  --batch keeps them (its slots' prompts lend while others decode).
+    // exp kv_tail_copies=1: copies for the region's lowest reach too, no homes.
+    const bool kv_tail_copies = basalt::core::exp_flag("kv_tail_copies", o.batch > 0 ? 1 : 0) != 0;
+    if (kv_tail_slots > 0 && kv_tail_copies)
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
+    // a swap takes a free place only for an evicted expert with no RAM copy: the slots below the lend region keep none,
+    // so the places follow their share of the cache
+    auto spare_places = [&](int64_t full) -> int64_t {
+        if (lend_from < 0 || xcache.slots() <= 0) return full;
+        return (full * lend_from + xcache.slots() - 1) / xcache.slots();
+    };
     // ---- the start-up picks for the settings the user left out (peer-exclusive, resident RAM, pool affinity and
     // size): one pure rule over what this machine and pack have, so a given setting is never replaced.  The pool is
     // built here, with the picks.
@@ -4398,7 +4408,7 @@ int main(int argc, char** argv) {
         in.complement_peer_excl = in.complement_full - std::min(in.complement_full, peer_expert_room());
         // the RAM copy also holds the free places the adaptive swaps use (see set_spares)
         const uint64_t blob = basalt::kernels::cpu::expert_layout().max_blob;
-        const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
+        const uint64_t spares_full = adapt_fast_on ? (uint64_t) spare_places(o.adapt_swaps * kSatBoost) * blob : 0;
         const uint64_t spares_excl =
             adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
         in.complement_full += lent_bytes + spares_full;
@@ -4487,7 +4497,7 @@ int main(int argc, char** argv) {
         // --peer-exclusive: peer swaps take places too (an evicted peer expert goes to one)
         if (adapt_fast_on)
             src.set_spares(o.peer_exclusive ? o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)
-                                            : o.adapt_swaps * kSatBoost);
+                                            : spare_places(o.adapt_swaps * kSatBoost));
         uint64_t resident_headroom = resident_headroom_base;
         // The experts no GPU tier holds, and the RAM there is for them: when the copy cannot hold them all, the rest
         // are read from the file through the OS file cache, so the copy leaves that cache its floor beside the margin.
@@ -4543,7 +4553,7 @@ int main(int argc, char** argv) {
             // Allow the backed slots plus a fixed amount of file reading per prompt.  Those reads are evictable page
             // cache that the refill passes through once, so two chunks' worth are funded; the read-time cap
             // (kMaxAutoChunk) bounds the chunk, so the ceiling stops there too.
-            const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - kv_tail_slots) +
+            const int64_t allow = std::max<int64_t>(0, src.resident_lent_slots() - (kv_tail_copies ? kv_tail_slots : 0)) +
                                   (int64_t) (2 * basalt::platform::kPromptFileReadBytes / std::max<uint64_t>(1, basalt::kernels::cpu::expert_layout().max_blob));
             auto_ceiling = std::max<int64_t>(8192, engine_local::biggest_chunk(std::min<int64_t>(auto_ceiling, kMaxAutoChunk),
                                                                  [&](int64_t t) { return serve_loans::lend_slots(xcache, g, ss, t) <= allow; }));
@@ -6490,12 +6500,12 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
-        // a request also stops when the RAM guard reads MemAvailable below its floor; `ram_stop` keeps that it did, so
-        // the request ends on an error instead of a cancel
+        // a request also stops when the RAM guard judges the RAM critical; `ram_stop` keeps that it did, so the request
+        // ends on an error instead of a cancel
         std::atomic<bool> ram_stop{false};
         auto halted = [&]() -> bool {
             if (stop_req.load() || stdin_lost.load()) return true;
-            if (!basalt::platform::ram_guard_low()) return false;
+            if (basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Critical) return false;
             ram_stop.store(true);
             return true;
         };
@@ -6616,9 +6626,33 @@ int main(int argc, char** argv) {
         }
         report_expert_tiers();
         basalt::platform::stop_memory_watchdog();
-        // from here a request that runs the RAM below the floor stops with an error instead of the machine swapping
+        // from here the RAM guard watches: below its floor the engine sheds and new requests wait, and a running
+        // request stops only once the RAM is critical
         const uint64_t guard_floor = basalt::platform::ram_guard_floor(basalt::platform::ram_margin(), tier_file_bytes);
         basalt::platform::start_ram_guard(guard_floor);
+        // what a stop's error compares against, to tell the engine's own growth from other programs'
+        const uint64_t ready_avail = basalt::platform::available_memory();
+        const uint64_t ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
+        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go and
+        // the heap's free pages return to the OS.  The checkpoints stay: a live request's rewind and the deferred
+        // copy in flight use them.
+        uint64_t shed_drop = 0;
+        auto shed_if_low = [&]() {
+            if (basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok) return;
+            const uint64_t drop = basalt::platform::ram_guard_drops();
+            if (drop == shed_drop) return;
+            shed_drop = drop;
+            const size_t parked = conversations.size();
+            const size_t freed = conversations.clear();
+            if (freed > 0)
+                basalt::log::info("basalt serve", "RAM guard: dropped %zu parked conversations (%zu MiB)", parked,
+                                  freed >> 20);
+            const uint64_t before = basalt::platform::available_memory();
+            basalt::platform::release_free_heap();
+            const uint64_t after = basalt::platform::available_memory();
+            basalt::log::info("basalt serve", "RAM guard: free heap returned to the OS, %lld MiB free now (%+lld MiB)",
+                              (long long) (after >> 20), ((long long) after - (long long) before) / (1ll << 20));
+        };
         // a VRAM shrink's RAM homes leave the guard's floor above the margin and the top-up's own slack free
         src.set_homes_reserve(guard_floor - std::min(guard_floor, basalt::platform::ram_margin()) + (256ull << 20));
         if (const uint64_t avail = basalt::platform::available_memory(); avail > 0)
@@ -6960,6 +6994,19 @@ int main(int argc, char** argv) {
             if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
             res_upload();
             relend();
+            // the tail without RAM copies: the experts in slots below the loan again give their RAM homes back
+            if (!kv_tail_copies && src.complement_ready() && src.homes_bytes() > 0) {
+                const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+                size_t released = 0;
+                for (size_t j = 0; j < host_res.size(); ++j)
+                    if (host_res[j] >= 0 && host_res[j] < loan_from &&
+                        src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                        ++released;
+                const uint64_t freed = released > 0 ? src.homes_reclaim() + src.homes_compact() : 0;
+                if (released > 0)
+                    basalt::log::info("basalt serve", "elastic KV: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept",
+                                      released, (double) freed / 1048576.0, (double) src.homes_bytes() / 1048576.0);
+            }
             return true;
         };
         // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
@@ -8113,6 +8160,35 @@ int main(int argc, char** argv) {
             stop_req.store(false);   // a STOP that arrived between requests is stale
             ram_stop.store(false);
             err.clear();
+            // RAM below the guard's floor (another program's peak): shed, then let it come back before the request
+            // starts; a STOP ends the wait, and the request then ends as cancelled
+            if (!batch_on() && basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok) {
+                shed_if_low();
+                uint64_t avail = 0, floor = 0;
+                (void) basalt::platform::ram_guard_level(&avail, &floor);
+                basalt::log::info("basalt serve", "RAM low (%llu MiB free < %llu MiB guard): the request waits up to "
+                                  "%llu s", (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20),
+                                  (unsigned long long) (basalt::platform::kRamAdmitWaitMs / 1000));
+                basalt::core::progress_at("RAM wait");
+                const auto w0 = Clock::now();
+                auto waited = [&] {
+                    return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - w0).count();
+                };
+                while (!stop_req.load() && !stdin_lost.load() &&
+                       basalt::platform::ram_admit_waits(basalt::platform::ram_guard_level(), waited())) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    basalt::core::progress_beat();
+                }
+                const basalt::platform::RamLevel level = basalt::platform::ram_guard_level(&avail, &floor);
+                if (level == basalt::platform::RamLevel::Ok)
+                    basalt::log::info("basalt serve", "RAM back after %.1f s (%llu MiB free): the request starts",
+                                      waited() / 1000.0, (unsigned long long) (avail >> 20));
+                else if (!stop_req.load() && !stdin_lost.load())
+                    basalt::log::warn("basalt serve", "RAM still low after %.1f s (%llu MiB free < %llu MiB guard): the "
+                                      "request starts", waited() / 1000.0, (unsigned long long) (avail >> 20),
+                                      (unsigned long long) (floor >> 20));
+                basalt::core::progress_at("request");
+            }
             if (mtp_on && !mtp.use_main(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }   // (batch windows swap the draft K/V)
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
@@ -8603,6 +8679,20 @@ int main(int argc, char** argv) {
             if (!kv_ok) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            // the tail without RAM copies: the loan follows the cache's end down as the KV grows, so the experts it
+            // reaches below the copies' region take a home before the prompt is read
+            int64_t loan_chunk = 0;
+            if (!kv_tail_copies && kv_floor > 0 && !in_slot && lend_from > 0 && !pf_parts.empty() &&
+                pf_parts[0].first >= 0 && loan_plan(xcache.slots(), loan_chunk) < lend_from) {
+                if (!kv_drain(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                std::string he;
+                if (!home_given_up(xcache.slots(), he))
+                    basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
+                                         "the prompt reads them from the file", he.c_str());
             }
             if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
@@ -10357,6 +10447,7 @@ int main(int argc, char** argv) {
                                        std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                     basalt::core::decode_gaps().mark(17);
                     if (eos) { finish = "stop"; break; }
+                    shed_if_low();
                     if (halted()) { finish = "cancel"; break; }
                     x = outv[(size_t) a];
                     p += a + 1;
@@ -10412,6 +10503,7 @@ int main(int argc, char** argv) {
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 basalt::core::decode_gaps().mark(17);
                 if (eos) { finish = "stop"; break; }
+                shed_if_low();
                 if (halted()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
@@ -10485,13 +10577,16 @@ int main(int argc, char** argv) {
             } else if (ram_out) {
                 // the client gets the reason as the request's error; the engine stays up for the next request
                 uint64_t avail = 0, floor = 0;
-                (void) basalt::platform::ram_guard_low(&avail, &floor);
-                char msg[320];
-                std::snprintf(msg, sizeof msg, "RAM low (%llu MiB free < %llu MiB guard): request stopped; lower "
-                                               "--resident-budget-gib",
-                              (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
-                basalt::log::error("basalt", "%s", msg);
-                std::printf("ERR %s\n", msg);
+                basalt::platform::MemoryStalls stalls;
+                (void) basalt::platform::ram_guard_level(&avail, &floor, &stalls);
+                // what the engine grew by since it was ready, and what the rest of the drop in free RAM went to
+                const uint64_t rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
+                const uint64_t own = rss > ready_rss ? rss - ready_rss : 0;
+                const uint64_t drop = ready_avail > avail ? ready_avail - avail : 0;
+                const std::string msg = basalt::platform::ram_stop_message(avail, floor, basalt::platform::kRamHardFloor,
+                                                                           stalls, drop > own ? drop - own : 0, own);
+                basalt::log::error("basalt", "%s", msg.c_str());
+                std::printf("ERR %s\n", msg.c_str());
             }
             if (!ram_out && yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             if (!ram_out) std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
