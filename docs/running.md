@@ -21,13 +21,13 @@ share a long system prompt read it once.
 
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
-With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
-fine): each session backs its first 32768
+With `--max-context` above 8192 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
+fine): each session backs its first 8192
 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables and the draft layer's K/V alike), and the
-rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
+rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 8192 cells before the prompt is read (and 8192 more whenever decode runs past that) by taking
 those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
 The next request that needs less gives the cells back and the cache refills the slots from RAM. A short request so
-decodes with the cache a 32k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
+decodes with the cache an 8k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
 once its share of the context is above 4096 tokens: it backs 4096 cells at startup and grows by 4096, so idle and short
 slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says
 how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`). The cache never goes
@@ -36,7 +36,7 @@ the cells they do not hold, is refused with that error, and a reply that grows p
 slot ends as at its length limit); the engine keeps running.
 
 A request that starts decoding at 99328 tokens or deeper keeps its K/V in pinned RAM instead (the host K/V): attention
-reads it through a VRAM pool of 32768 cells, so the cache keeps its tail slots. A conversation switches at a turn that
+reads it through a VRAM pool of 32768 cells (backed while it streams), so the cache keeps its tail slots. A conversation switches at a turn that
 reads at most 32768 new prompt tokens (a continuation); a turn that reads a longer prompt stays in VRAM, since a long
 streamed read costs more than its decode wins back, and the conversation's next turn switches. The pin covers the
 prompt, up to 16384 new tokens and 4096 more, on a 16384-cell grid; a reply that outgrows it gets a pool for its next

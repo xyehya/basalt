@@ -2631,7 +2631,7 @@ int main(int argc, char** argv) {
     // streaming (its pools are a fixed set of VRAM pages) nor with --vram-elastic (that resizes the same tail).
     // With --batch a session's base is smaller: the slots' sessions are many, and an idle or short one would hold its
     // whole base out of the expert cache.
-    constexpr int64_t kKvElasticFloor = 32768, kKvElasticFloorBatch = 4096;
+    constexpr int64_t kKvElasticFloor = 8192, kKvElasticFloorBatch = 4096;
     const int64_t kv_base = o.batch > 0 ? kKvElasticFloorBatch
                                         : (int64_t) basalt::core::exp_flag("kv_floor", (double) kKvElasticFloor);
     const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
@@ -6964,7 +6964,7 @@ int main(int argc, char** argv) {
         // pools map that VRAM, zeroed.  `kv_release` gives a session's cells past `cells` back and the cache maps its
         // tail again, each returned slot refilled from RAM.  Both run between windows, never inside one.
         // a request's room past its prompt, and each later step (batch slots: a smaller step, as their base)
-        const int64_t kKvGrowCells = o.batch > 0 ? 4096 : (int64_t) basalt::core::exp_flag("kv_grow", 16384);
+        const int64_t kKvGrowCells = o.batch > 0 ? 4096 : (int64_t) basalt::core::exp_flag("kv_grow", 8192);
         constexpr int64_t kKvWindowCells = 2 * basalt::kernels::kVerifyMaxT + 64;   // a decoding session's next window
         int64_t kv_moves = 0;
         // the expert cache never shrinks below the slots the prompt path's smallest loan needs (a 256-token chunk, and
