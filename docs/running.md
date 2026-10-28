@@ -47,9 +47,10 @@ plus what serving can still take (its budget less the checkpoints and parked con
 the prompt path's loan then needs; otherwise the request keeps its K/V in VRAM (`host K/V: kept in VRAM ...`). It is
 on by default with one GPU, the experts' RAM copy, a prompt path that lends cache slots and a KV other than `k8v4`; not
 with `--parallel`, a layer split, `--kv-resident` or `--vram-elastic`, where the K/V stays in VRAM.
-`"exp": "kv_host=0"` in the config's `engine` section turns it off. A streamed request's tokens are the same as from
-the VRAM tail at the same expert placement; the freed VRAM holds more experts, so in serving the placement, and with it
-the text, can differ ([precision](precision/index.md)). Until a request streams, the VRAM, the expert cache and the
+`"exp": "kv_host=0"` in the config's `engine` section turns it off. A streamed request decodes as from the VRAM tail
+at the same expert placement; its prompt read lends a few more cache slots (the staging pool), which can move the last
+bits of a short read's K/V, and the freed VRAM holds more experts, so in serving the text can differ
+([precision](precision/index.md)). Until a request streams, the VRAM, the expert cache and the
 prompt chunks are what they are with it off.
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
