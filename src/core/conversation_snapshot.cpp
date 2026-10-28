@@ -86,7 +86,7 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
         st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
         (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
-        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
+        l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && (!st.host.present() || l.cells > st.host_cells))) {
         error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
         return false;
     }
