@@ -44,7 +44,8 @@ prompt, up to 16384 new tokens and 4096 more, on a 16384-cell grid; a reply that
 request goes back to the VRAM tail too, and so does a streamed session when a request arrives with the RAM below the
 guard's floor (the pin is freed). A pin, and each larger one, is taken only when it leaves the RAM guard's floor free
 plus what serving can still take (its budget less the checkpoints and parked conversations held now) and the RAM copies
-the prompt path's loan then needs; otherwise the request keeps its K/V in VRAM (`host K/V: kept in VRAM ...`). It is
+the prompt path's loan then needs, counting the RAM copies the cache gives back as it gets its tail back; otherwise the
+request keeps its K/V in VRAM (`host K/V: kept in VRAM ...`). It is
 on by default with one GPU, the experts' RAM copy, a prompt path that lends cache slots and a KV other than `k8v4`; not
 with `--parallel`, a layer split, `--kv-resident` or `--vram-elastic`, where the K/V stays in VRAM.
 `"exp": "kv_host=0"` in the config's `engine` section turns it off. A streamed request's tokens are the same as from

@@ -213,6 +213,26 @@ int main() {
         CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
         CHECK(plan_kv_host(in, 98304).act == KvHostAct::drop);   // nor for a larger pool beside the one held
     }
+    {   // the RAM homes a take may give back count once the pin leaves the homes' floor free; none for a larger pool
+        const uint64_t M = 1ull << 20;
+        KvHostInputs in;
+        in.crossover_cells = 99328;
+        in.cells = 163840;
+        in.bytes_per_cell = (uint64_t) (1.93 * (double) G) / (uint64_t) in.cells;
+        const uint64_t pin = (uint64_t) in.cells * in.bytes_per_cell;
+        in.ram_available = (uint64_t) (6.28 * (double) G);
+        in.ram_kept = (uint64_t) (4.55 * (double) G);
+        in.ram_floor = (uint64_t) (3.09 * (double) G) + 256 * M;
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::none);       // 0.2 GiB short
+        in.ram_back = 930 * M;                                   // the homes the VRAM tail holds
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        CHECK(plan_kv_host(in, 98304).act == KvHostAct::drop);   // a larger pool beside one held: no homes back
+        in.ram_available = in.ram_floor + pin - 1;               // the pin itself must leave the floor
+        in.ram_back = 4 * G;
+        CHECK(!choose_kv_host(in).host);
+        in.ram_available += 1;
+        CHECK(choose_kv_host(in).host);
+    }
     {   // a pool held is given back when the RAM guard is below its floor, even when it covers the request
         KvHostInputs in;
         in.crossover_cells = 99328;

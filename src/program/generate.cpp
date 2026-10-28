@@ -7243,6 +7243,10 @@ int main(int argc, char** argv) {
             in.ram_available = kv_ram_now();
             in.ram_kept = kv_host_kept();
             in.ram_low = basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok;
+            // a take gives the cache's tail back, and with it the RAM homes of the experts that go back into slots: at
+            // most those held now (checked once the take is done), while the pin leaves the homes' own floor free
+            in.ram_back = kv_pool.valid() ? 0 : src.homes_bytes();
+            in.ram_floor = guard_floor + (256ull << 20);
             in.read_cells = std::max<int64_t>(read, 0);
             in.fresh_cells = std::max<int64_t>(kv_host_fresh, 0);
             const basalt::program::KvHostPlan plan = basalt::program::plan_kv_host(in, kv_pool.valid() ? kv_pool.cells() : 0);
@@ -7264,9 +7268,10 @@ int main(int argc, char** argv) {
                                  (long long) cells, (long long) in.fresh_cells);
                 if (std::strcmp(plan.why, "no RAM") == 0)
                     basalt::log::info("basalt serve", "host K/V: kept in VRAM (no RAM), %lld cells need %.2f GiB pinned, "
-                                         "%.2f GiB free, %.2f GiB kept free", (long long) cells,
+                                         "%.2f GiB free, %.2f GiB of RAM homes held, %.2f GiB kept free", (long long) cells,
                                  (double) ((uint64_t) cells * in.bytes_per_cell) / 1073741824.0,
-                                 (double) in.ram_available / 1073741824.0, (double) in.ram_kept / 1073741824.0);
+                                 (double) in.ram_available / 1073741824.0, (double) in.ram_back / 1073741824.0,
+                                 (double) in.ram_kept / 1073741824.0);
                 return 1;
             case basalt::program::KvHostAct::keep:
                 return 1;
@@ -7284,21 +7289,24 @@ int main(int argc, char** argv) {
                     !cache_regrow(e) || !ver.sync_kv_mode(e))
                     return -1;
                 relend();   // the prompt path's layout follows the mode: its loan now carries the staging pool
-                // the RAM homes that loan takes next are charged, less those the take freed; short of RAM for them the
+                // the RAM homes count as the take really freed them, less those its loan takes next; short of RAM the
                 // request goes back to the VRAM tail
                 {
                     const uint64_t now = src.homes_bytes(), need = loan_home_bytes();
                     const uint64_t freed = homes0 > now ? homes0 - now : 0;
                     basalt::program::KvHostInputs got = in;
+                    got.ram_floor = 0;
+                    got.ram_back = freed > need ? freed - need : 0;
                     got.ram_kept += need > freed ? need - freed : 0;
-                    if (got.ram_kept > in.ram_kept && !basalt::program::choose_kv_host(got).host) {
+                    if ((in.ram_back > 0 || need > freed) && !basalt::program::choose_kv_host(got).host) {
                         const int r = kv_host_to_vram(at, live_c, pe, e);
                         if (r < 0) return -1;
                         if (r > 0) {
-                            basalt::log::info("basalt serve", "host K/V: kept in VRAM (no RAM for the loan's RAM homes), "
-                                                 "%lld cells, %.0f MiB of homes, %.2f GiB free, %.2f GiB kept free",
-                                         (long long) cells, (double) (need - freed) / 1048576.0,
-                                         (double) in.ram_available / 1073741824.0, (double) got.ram_kept / 1073741824.0);
+                            basalt::log::info("basalt serve", "host K/V: kept in VRAM (no RAM once the take is done), %lld "
+                                                 "cells, %.0f MiB of RAM homes freed, %.0f MiB for the loan, %.2f GiB free, "
+                                                 "%.2f GiB kept free", (long long) cells, (double) freed / 1048576.0,
+                                         (double) need / 1048576.0, (double) in.ram_available / 1073741824.0,
+                                         (double) in.ram_kept / 1073741824.0);
                             return 1;
                         }
                         basalt::log::warn("basalt serve", "host K/V: %s; the request streams from the pool it has", pe.c_str());
