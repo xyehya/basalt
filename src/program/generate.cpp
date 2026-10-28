@@ -4367,8 +4367,8 @@ int main(int argc, char** argv) {
     }
     // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
     // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-    // (exp kv_tail_copies=0: the tail keeps no copies, for a session whose KV lives in host RAM; a tail slot lent to
-    // the KV anyway is then read from the file)
+    // (exp kv_tail_copies=0: the tail keeps no copies; the experts the prompt's loan then reaches without a copy take
+    // a RAM home at the request's admission)
     const bool kv_tail_copies = basalt::core::exp_flag("kv_tail_copies", 1) != 0;
     if (kv_tail_slots > 0 && kv_tail_copies)
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
@@ -6969,6 +6969,18 @@ int main(int argc, char** argv) {
             if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
             res_upload();
             relend();
+            // the tail without RAM copies: the experts in slots below the loan again give their RAM homes back
+            if (!kv_tail_copies && src.complement_ready() && src.homes_bytes() > 0) {
+                const int64_t loan_from = pf_parts.empty() || pf_parts[0].first < 0 ? INT64_MAX : pf_parts[0].first;
+                size_t released = 0;
+                for (size_t j = 0; j < host_res.size(); ++j)
+                    if (host_res[j] >= 0 && host_res[j] < loan_from &&
+                        src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
+                        ++released;
+                const uint64_t freed = src.homes_reclaim() + src.homes_compact();
+                basalt::log::info("basalt serve", "elastic KV: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept",
+                                  released, (double) freed / 1048576.0, (double) src.homes_bytes() / 1048576.0);
+            }
             return true;
         };
         // `shrink` false: only VRAM that is free now (a prompt read is running beside the windows, its loan in the
@@ -8612,6 +8624,18 @@ int main(int argc, char** argv) {
             if (!kv_ok) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            // the tail without RAM copies: the loan follows the cache's end down as the KV grows, so the experts it
+            // reaches that have no RAM copy take a home before the prompt is read (none to take: nothing is copied)
+            if (!kv_tail_copies && kv_floor > 0 && !in_slot) {
+                if (!kv_drain(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+                std::string he;
+                if (!home_given_up(xcache.slots(), he))
+                    basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
+                                         "the prompt reads them from the file", he.c_str());
             }
             if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
