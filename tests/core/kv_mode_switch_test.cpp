@@ -132,6 +132,7 @@ int run(int fmt) {
     c::KvHostPool pool, pool2;
     std::string err;
     int bad = 0, batches = 0;
+    k::KvStreamCounters cn{};   // the streamed phase's, read before the switch back frees the residency map
     const uint64_t page_kv = k::kv_block_bytes(s, fmt);
 
     for (int64_t pos = 0; pos < N; ++pos) {
@@ -143,6 +144,10 @@ int run(int fmt) {
             }
             std::printf("  %s: streamed at %lld cells, %.1f MiB host, %.1f MiB VRAM arena\n", name, (long long) pos,
                         (double) pool.bytes() / 1048576.0, (double) st.kv_arena->mapped_bytes() / 1048576.0);
+            if (st.host_map == nullptr || st.map.slot_block == nullptr) {
+                std::fprintf(stderr, "  %s: streamed without a residency map\n", name);
+                ++bad;
+            }
         }
         if (pos == grow_at) {   // 1 -> 1: a larger pool, the cells moved over in host memory
             if (!pool2.reserve(ss, g, N + 64, err) || !pool2.copy_from(pool, pos, err) ||
@@ -153,6 +158,7 @@ int run(int fmt) {
             pool.release();
         }
         if (pos == back_at) {   // 1 -> 0: uncap, back the depth, copy the cells in
+            cn = k::kv_stream_counters(st.map);
             c::session_kv_cap(ss, false);
             if (!st.kv_arena->map(pos + 4096, err) || !c::session_kv_set_mode(ss, g, 0, nullptr, pos, nullptr, err)) {
                 std::fprintf(stderr, "%s: switch to 0 at %lld: %s\n", name, (long long) pos, err.c_str());
@@ -174,6 +180,10 @@ int run(int fmt) {
             }
             std::printf("  %s: back in VRAM at %lld cells: K/V %s\n", name, (long long) pos, eq ? "identical" : "DIFFERS");
             if (!eq) ++bad;
+            if (st.host_map != nullptr || st.map.slot_block != nullptr) {
+                std::fprintf(stderr, "  %s: the residency map outlived the switch back\n", name);
+                ++bad;
+            }
             pool2.release();
         }
         // the arena follows the depth as the engine's kv_fit does (in mode 1 only the pooled keys and rope grow)
@@ -238,7 +248,6 @@ int run(int fmt) {
             if (!same || !back) ++bad;
         }
     }
-    const k::KvStreamCounters cn = k::kv_stream_counters(st.map);
     std::printf("  %s: %d batches, %llu lookups, %llu misses, overflow %d, %d failures\n", name, batches,
                 (unsigned long long) cn.lookups, (unsigned long long) cn.misses, (int) cn.overflow, bad);
     if (cn.overflow || cn.misses == 0) ++bad;
