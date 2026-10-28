@@ -418,7 +418,7 @@ add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefil
 target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
-add_executable(basalt src/program/generate.cpp src/program/probe_rates.cpp)
+add_executable(basalt src/program/generate.cpp src/program/probe_rates.cpp src/program/serve/loans.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
@@ -466,6 +466,12 @@ set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_S
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
 add_subdirectory(tools/vision)
 target_link_libraries(basalt PRIVATE vision_cuda)
+if(BUILD_TESTING)
+  # the host half of the vision library needs no GPU: the decode guard is checked here
+  add_executable(vision_preprocess_test tests/vision/preprocess_limit_test.cpp)
+  target_link_libraries(vision_preprocess_test PRIVATE vision_core)
+  basalt_cpu_test(NAME vision_preprocess_test COMMAND vision_preprocess_test)
+endif()
 add_dependencies(basalt-bench basalt basalt-device git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
 target_link_libraries(basalt-bench PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
