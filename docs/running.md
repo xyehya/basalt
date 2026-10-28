@@ -35,6 +35,16 @@ below the slots a prompt chunk needs: a request whose KV would take it there, ev
 the cells they do not hold, is refused with that error, and a reply that grows past it ends with it (a `--parallel`
 slot ends as at its length limit); the engine keeps running.
 
+A request that starts decoding at 99328 tokens or deeper keeps its K/V in pinned RAM instead (the host K/V): attention
+reads it through a VRAM pool of 32768 cells, so the cache keeps its tail slots. The pin covers the prompt, up to 16384
+new tokens and 4096 more; a reply that outgrows it gets 16384 more cells between two decode windows, or goes back to
+the VRAM tail when the RAM is short. The next shallower request goes back to the VRAM tail too. A pin is taken only
+when it leaves the RAM guard's floor free plus what serving can still take (its budget less the checkpoints and parked
+conversations held now), counting the RAM the experts that go back into the cache give back; otherwise the request
+keeps its K/V in VRAM (`host K/V: kept in VRAM (no RAM) ...`). It is on by default with one GPU, the experts' RAM copy
+and a KV other than `k8v4`; not with `--parallel`, a layer split or `--kv-resident`, where the K/V stays in VRAM.
+`"exp": "kv_host=0"` in the config's `engine` section turns it off. Greedy output is the same either way.
+
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
 share of its experts. Its first token so comes about as soon as on an idle engine. A longer prompt is read beside them:

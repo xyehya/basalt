@@ -380,7 +380,7 @@ void usage() {
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
                  "  --serve              stay resident and take requests on stdin (the server's mode)\n"
                  "  --exp NAME=VALUE[,...]  diagnostics; concur9_logit_hash=1 prints a hash of each accepted row's\n"
-                 "                       logits on stderr\n"
+                 "                       logits on stderr; kv_host=0 keeps every request's K/V in VRAM (--serve)\n"
                  "  --gpu A,B,..|auto    the GPUs to use, as nvidia-smi numbers them (within CUDA_VISIBLE_DEVICES when\n"
                  "                       set): exactly these, the first the main card; the engine gives the rest their\n"
                  "                       roles.  auto = every Blackwell card, the fastest as main.  Default: GPU 0 alone\n"
@@ -2636,17 +2636,20 @@ int main(int argc, char** argv) {
     const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
                              o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
-    // ---- THE PER-REQUEST HOST K/V (--exp kv_host=1): the solo session's elastic states can also stream, a slot pool
-    // of the floor's pages in VRAM and the request's K/V in a pinned host pool; each request is admitted to one mode
-    // (kv_host_admit below).  One GPU, one request at a time, INT8/FP16/Q4_0 K/V.
-    const bool kv_host_asked = basalt::core::exp_flag("kv_host", 0) != 0;
-    const char* kv_host_off = !kv_host_asked ? nullptr
+    // ---- THE PER-REQUEST HOST K/V (on by default; --exp kv_host=0 turns it off): the solo session's elastic states can
+    // also stream, a slot pool of the floor's pages in VRAM and the request's K/V in a pinned host pool; each request is
+    // admitted to one mode (kv_host_admit below).  One GPU, one request at a time, INT8/FP16/Q4_0 K/V.  Where it cannot
+    // apply every request keeps its K/V in VRAM, said only when kv_host=1 asked for it.
+    const int kv_host_exp = (int) basalt::core::exp_flag("kv_host", -1);
+    const bool kv_host_forced = kv_host_exp > 0;
+    const char* kv_host_off = kv_host_exp == 0 ? "--exp kv_host=0"
                             : kv_floor <= 0 ? "it needs the elastic KV (--serve on one GPU, no --kv-resident or --vram-elastic)"
+                            : !split_devs.empty() ? "not with --layer-split"
                             : o.batch != 0 ? "not with --batch"
                             : o.kv == "k8v4" ? "not with --kv k8v4"
                             : nullptr;
-    if (kv_host_off != nullptr) basalt::log::warn("basalt generate", "host K/V is off: %s", kv_host_off);
-    const bool kv_host_on = kv_host_asked && kv_host_off == nullptr;
+    if (kv_host_off != nullptr && kv_host_forced) basalt::log::warn("basalt generate", "host K/V is off: %s", kv_host_off);
+    const bool kv_host_on = kv_host_off == nullptr;
     basalt::core::qsa_set_kv_host(kv_host_on ? kv_floor : 0);
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
@@ -7133,8 +7136,11 @@ int main(int argc, char** argv) {
         // the VRAM tail stays expert slots; any other keeps it in the elastic tail.  The solo session switches between
         // requests with its live cells; the pool stays while the session streams (the conversation's next turn resumes
         // from it).  `kv_host_admit`: 1 admitted (in either mode), 0 refused (`e`, the engine stays up), -1 failed.
-        const bool kv_host_live = kv_host_on && basalt::core::session_kv_can_stream(ss);
-        if (kv_host_on && !kv_host_live) basalt::log::warn("basalt serve", "host K/V is off: the session's KV cannot stream");
+        // by default only beside the experts' RAM copy: with a file mapping the pin would take the file cache's RAM
+        const bool kv_host_ram_copy = srcp == &src && src.complement_ready();
+        const bool kv_host_live = kv_host_on && basalt::core::session_kv_can_stream(ss) && (kv_host_forced || kv_host_ram_copy);
+        if (kv_host_on && kv_host_forced && !kv_host_live)
+            basalt::log::warn("basalt serve", "host K/V is off: the session's KV cannot stream");
         // a request that starts decoding below this depth (cells) decodes faster from the elastic tail than streamed
         const int64_t kv_host_cross = (int64_t) basalt::core::exp_flag("kv_host_cross", 99328);
         // a test's stand-in for the RAM free now, MiB (forces the fallback); negative: MemAvailable
