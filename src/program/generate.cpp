@@ -6978,9 +6978,10 @@ int main(int argc, char** argv) {
                     if (host_res[j] >= 0 && host_res[j] < loan_from &&
                         src.home_release((int64_t) j / g.n_expert, (int64_t) j % g.n_expert))
                         ++released;
-                const uint64_t freed = src.homes_reclaim() + src.homes_compact();
-                basalt::log::info("basalt serve", "elastic KV: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept",
-                                  released, (double) freed / 1048576.0, (double) src.homes_bytes() / 1048576.0);
+                const uint64_t freed = released > 0 ? src.homes_reclaim() + src.homes_compact() : 0;
+                if (released > 0)
+                    basalt::log::info("basalt serve", "elastic KV: %zu RAM homes released, %.0f MiB freed, %.0f MiB kept",
+                                      released, (double) freed / 1048576.0, (double) src.homes_bytes() / 1048576.0);
             }
             return true;
         };
