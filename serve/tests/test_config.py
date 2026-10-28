@@ -208,12 +208,12 @@ class Precedence(unittest.TestCase):
     def test_startup_line(self):
         self.assertEqual(engine_line(["--max-context", "32768", "--resident-experts", "--kv", "int8",
                                       "--control-vector-layer-range", "4", "44"], ["--spec", "7"]),
-                         "[server] engine: --max-context 32768 (config), --resident-experts (config), "
-                         "--kv int8 (config), --control-vector-layer-range 4 44 (config), --spec 7 (cli)")
-        self.assertEqual(engine_line([], ["--spec", "7"]), "[server] engine: --spec 7 (cli)")
+                         "[server] engine   ctx=32768 resident-experts kv=int8 control-vector-layer-range=4,44 "
+                         "(from config)  spec=7 (from cli)")
+        self.assertEqual(engine_line([], ["--spec", "7"]), "[server] engine   spec=7 (from cli)")
         self.assertEqual(engine_line([], [], grammar=(False, "cli")),
-                         "[server] engine: using default flags, grammar off (cli)")
-        self.assertEqual(engine_line([], []), "[server] engine: using default flags")
+                         "[server] engine   grammar=off (from cli)")
+        self.assertEqual(engine_line([], []), "[server] engine   defaults")
 
 
 class SamplingOptions(unittest.TestCase):
@@ -261,7 +261,7 @@ class SamplingOptions(unittest.TestCase):
 
     def test_startup_line_marks_the_source(self):
         self.assertEqual(sampling_line({"temperature": 0.8, "top_k": 20, "top_p": 0.9}, {"temperature"}, {"top_k"}),
-                         "[server] sampling defaults: temperature=0.8 (command line), top_k=20 (config), top_p=0.9")
+                         "[server] sampling temp=0.8(cli) top_k=20(config) top_p=0.9")
 
 
 class ThinkingBudget(unittest.TestCase):
@@ -307,13 +307,20 @@ class SlotContext(unittest.TestCase):
         a, _, file_words, cli_words = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
         line = engine_line(file_words, cli_words, (a.shared_context, a.parallel))
         self.assertEqual(flag_value(cli_words, "--max-context"), "16384")
-        self.assertIn("--max-context 16384 (cli: 65536 / 4 slots)", line)
+        self.assertIn("ctx=16384 (65536/4 slots)", line)
         self.assertNotIn("slots", engine_line(file_words, cli_words))
 
     def test_slot_full_context_keeps_the_whole(self):
         self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144", "--slot-full-context"]), 262144)
         self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144"],
                                       {"server": {"slot-full-context": True}}), 262144)
+
+    def test_answer_room_switch(self):
+        """On by default; off by --no-answer-room or the config's "answer-room": false (a switch on by default)."""
+        self.assertTrue(parse([])[0].answer_room)
+        self.assertFalse(parse(["--no-answer-room"])[0].answer_room)
+        self.assertFalse(parse([], {"server": {"answer-room": False}})[0].answer_room)
+        self.assertTrue(parse([], {"server": {"answer-room": True}})[0].answer_room)
 
 
 class EveryOption(unittest.TestCase):
@@ -337,7 +344,8 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            if name in ("api-key", "engine-bin", "grammar"):   # grammar is on by default: no-grammar differs, see test_grammar
+            # grammar and answer-room are on by default: their no- forms differ (test_grammar, test_answer_room_switch)
+            if name in ("api-key", "engine-bin", "grammar", "answer-room"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):

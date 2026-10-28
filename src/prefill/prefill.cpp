@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/basalt/prefill/prefill.hpp.
 #include "basalt/prefill/prefill.hpp"
+#include "basalt/prefill/stream_all.hpp"
 #include "basalt/core/mtp.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/core/diag.hpp"
@@ -74,9 +75,8 @@ inline int ahead_slots(size_t T) { return (int) std::min<size_t>(kAheadSlots, T 
 // ring_slots()-slot ring (nearly every expert is routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
 constexpr int RING_MAX = 384;           // the arrays; the ring itself is ring_slots()
-// The chunk size from which every expert streams: below it only the routed experts are staged.  Staging every
-// non-resident expert costs the same whatever the chunk, so it pays only once most of them are routed anyway.
-int64_t g_stream_all_min = 6144;
+// The chunk size from which every expert streams: below it only the routed experts are staged (stream_all.hpp).
+int64_t g_stream_all_min = kStreamAllDefault;
 inline int64_t stream_all_min() { return g_stream_all_min; }
 // The streamed ring's slots (one whole expert blob each, the same for every pack).  g_ring_depth caps the depth the
 // next layout is laid out with (a prompt read beside decoding slots lends fewer cache slots with a shallower ring).
@@ -1255,6 +1255,7 @@ void Prefill::set_ring_remote(const int32_t* res, const core::ExpertCache* cache
 }
 
 void Prefill::set_peer_share(bool on) { impl_->peer_share = on; }
+int64_t Prefill::peer_routed_rows_max() const { return impl_->pp ? impl_->pp->T_max : 0; }
 
 void Prefill::set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
     if (layer_end < 0 && impl_->g != nullptr) layer_end = impl_->g->n_layers;   // after init: resolved here
@@ -2870,6 +2871,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         if (next_ != nullptr && keep_last_ && c0 + T >= n) continue;   // kept: its later layers run on this card next
+        if (next_ != nullptr && keep_last_ && keep_here && keep_here(p0 + T)) break;   // kept, and the run ends with it
         if (next_ != nullptr) {
             if (T > m.hand_rows || m.hand[hand_buf_] == nullptr) {
                 err = "prefill: the layer split's hand-off buffers are too small for the chunk";
@@ -2920,6 +2922,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     stats_.ms_total += ms_since(t_start);
     return true;
 }
+
+float* Prefill::hand_buffer(int b) const { return b == 0 || b == 1 ? impl_->hand[b] : nullptr; }
+
+int64_t Prefill::hand_rows() const { return impl_->hand[0] != nullptr && impl_->hand[1] != nullptr ? impl_->hand_rows : 0; }
 
 bool Prefill::reserve_hand_off(int64_t rows, std::string& err) {
     Impl& m = *impl_;
