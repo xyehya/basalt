@@ -358,6 +358,11 @@ if(BUILD_TESTING)
   target_link_libraries(conversation_validation_test PRIVATE engine)
   basalt_cpu_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   set_tests_properties(conversation_validation_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+  # the per-request host K/V's arithmetic: the switchable state's carve, the host copy's layout, the switch's refusals
+  add_executable(kv_host_layout_test tests/core/kv_host_layout_test.cpp)
+  target_link_libraries(kv_host_layout_test PRIVATE engine)
+  basalt_cpu_test(NAME kv_host_layout_test COMMAND kv_host_layout_test)
+  set_tests_properties(kv_host_layout_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 60)
   # The transfer-failure paths are reached by GNU ld's --wrap, which symbolizes the three runtime calls. The Windows
   # linker has no equivalent, so that one program is not built here; the same source builds the ordinary snapshot
   # test above, which does port.
