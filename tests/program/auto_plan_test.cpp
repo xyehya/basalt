@@ -188,7 +188,7 @@ int main() {
         in.cells = 40 * 1024;                       // a shallow request after a deep one: back to VRAM, pool freed
         p = plan_kv_host(in, 144 * 1024);
         CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "shallow");
-        in.crossover_cells = 0;                     // a forced host mode (crossover 0): every request that fits streams
+        in.crossover_cells = 0;                     // exp kv_host_cross=0: every request that fits streams
         CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
         CHECK_STR(kv_host_act_name(KvHostAct::grow), "grow");
     }
@@ -212,6 +212,53 @@ int main() {
         in.ram_kept = kv_host_keep(guard, budget, 400 * M);      // not enough of it held
         CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
         CHECK(plan_kv_host(in, 98304).act == KvHostAct::drop);   // nor for a larger pool beside the one held
+    }
+    {   // a pool held is given back when the RAM guard is below its floor, even when it covers the request
+        KvHostInputs in;
+        in.crossover_cells = 99328;
+        in.cells = 131072;
+        in.bytes_per_cell = 12963;
+        in.ram_available = 8 * G;
+        in.ram_kept = 5 * G;
+        CHECK(plan_kv_host(in, 147456).act == KvHostAct::keep);
+        in.ram_low = true;
+        in.ram_available = 3 * G;
+        const KvHostPlan p = plan_kv_host(in, 147456);
+        CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "no RAM");
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
+    }
+    {   // a deep request that reads a long fresh prompt stays in the VRAM tail; a short read (a continuation) streams,
+        // and a session already streamed keeps streaming whatever it reads
+        KvHostInputs in;
+        in.crossover_cells = 99328;
+        in.cells = 147456;
+        in.bytes_per_cell = 12963;
+        in.ram_available = 9 * G;
+        in.ram_kept = 5 * G;
+        in.fresh_cells = 32768;
+        in.read_cells = 131072;
+        KvHostPlan p = plan_kv_host(in, 0);
+        CHECK(!p.host && p.act == KvHostAct::none && std::string(p.why) == "fresh");
+        in.read_cells = 2000;
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        in.read_cells = 32768;
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        in.read_cells = 131072;
+        CHECK(plan_kv_host(in, 163840).act == KvHostAct::keep);
+        in.cells = 180224;                          // deeper than the pool held: a larger one, not the VRAM tail
+        CHECK(plan_kv_host(in, 163840).act == KvHostAct::grow);
+        in.cells = 40960;                           // shallow: as before
+        CHECK(std::string(plan_kv_host(in, 0).why) == "shallow");
+        in.cells = 147456;
+        in.fresh_cells = 0;                         // no limit
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+    }
+    {   // a pool that cannot grow still serves a request when it holds the prompt and the next decode window
+        CHECK(kv_host_pool_serves(131072, 120000, 2112));
+        CHECK(kv_host_pool_serves(131072, 128960, 2112));
+        CHECK(!kv_host_pool_serves(131072, 128961, 2112));
+        CHECK(!kv_host_pool_serves(0, 0, 2112));
+        CHECK(!kv_host_pool_serves(98304, 120000, 2112));   // the case admission's drop path refused before: smaller
     }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");

@@ -70,6 +70,10 @@ struct KvHostInputs {
     uint64_t bytes_per_cell = 0;          ///< host K/V bytes per cell over every QSA layer
     uint64_t ram_available = 0;           ///< bytes free now
     uint64_t ram_kept = 0;                ///< bytes that stay free beside the pin (kv_host_keep)
+    bool ram_low = false;                 ///< the RAM guard is below its floor: a pool held is given back, not kept
+    int64_t read_cells = 0;               ///< the prompt cells the request reads (the rest it reuses)
+    int64_t fresh_cells = 0;              ///< a session not streamed yet takes a pool only for a request that reads at
+                                          ///< most this many (0: any): a long streamed read costs more than it gains
 };
 
 /// The RAM a pin leaves free beside it: the guard's floor and what serving can still take, i.e. its budget less what
@@ -79,7 +83,7 @@ uint64_t kv_host_keep(uint64_t guard_floor, uint64_t serve_budget, uint64_t serv
 struct KvHostChoice {
     bool host = false;
     uint64_t pin_bytes = 0;               ///< what the host K/V takes when `host`
-    const char* why = "";                 ///< "shallow", "no RAM" or "host"
+    const char* why = "";                 ///< "shallow", "fresh", "no RAM" or "host"
 };
 
 KvHostChoice choose_kv_host(const KvHostInputs& in);
@@ -107,8 +111,11 @@ struct KvHostPlan {
 };
 
 /// `pool_cells`: the cells of the pool the session holds now (0: none, the session is in the VRAM tail).  A pool that
-/// covers a deep request is kept whatever the RAM is now (it is pinned already); a larger one must fit beside it.
+/// covers a deep request is kept (it is pinned already) unless `ram_low`; a larger one must fit beside it.
 KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells);
+/// Whether a pool of `pool_cells` can still serve a request that starts decoding at `at` cells: its prompt and the
+/// next decode window (`window` cells); the output past it grows the pool between windows or stops the request.
+bool kv_host_pool_serves(int64_t pool_cells, int64_t at, int64_t window);
 const char* kv_host_act_name(KvHostAct a);
 
 /// "auto flags: peer-exclusive off, resident 51.2 GB, pool-affinity all, pool-workers 15", only the auto-picked keys;
