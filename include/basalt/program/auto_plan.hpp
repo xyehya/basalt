@@ -69,8 +69,14 @@ struct KvHostInputs {
     int64_t crossover_cells = 0;          ///< below this many cells the VRAM tail is the faster place
     uint64_t bytes_per_cell = 0;          ///< host K/V bytes per cell over every QSA layer
     uint64_t ram_available = 0;           ///< bytes free now
-    uint64_t ram_kept = 0;                ///< bytes that stay free: the guard, the serving budget, the RAM homes
+    uint64_t ram_kept = 0;                ///< bytes that stay free once the step is done (kv_host_keep)
+    uint64_t ram_back = 0;                ///< bytes the step gives back once the pin is taken (the RAM homes it frees)
+    uint64_t ram_floor = 0;               ///< bytes that stay free while the pin is taken, before `ram_back` returns
 };
+
+/// The RAM a pin leaves free beside it: the guard's floor and what serving can still take, i.e. its budget less what
+/// the session already holds of it (its checkpoints, the parked conversations).
+uint64_t kv_host_keep(uint64_t guard_floor, uint64_t serve_budget, uint64_t serve_held);
 
 struct KvHostChoice {
     bool host = false;
@@ -103,7 +109,8 @@ struct KvHostPlan {
 };
 
 /// `pool_cells`: the cells of the pool the session holds now (0: none, the session is in the VRAM tail).  A pool that
-/// covers a deep request is kept whatever the RAM is now (it is pinned already); a larger one must fit beside it.
+/// covers a deep request is kept whatever the RAM is now (it is pinned already); a larger one must fit beside it, with
+/// no `ram_back` (only a take frees RAM homes).
 KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells);
 const char* kv_host_act_name(KvHostAct a);
 

@@ -82,7 +82,9 @@ KvHostChoice choose_kv_host(const KvHostInputs& in) {
         return c;
     }
     const uint64_t pin = (uint64_t) in.cells * in.bytes_per_cell;
-    if (in.ram_available <= in.ram_kept || pin > in.ram_available - in.ram_kept) {
+    const uint64_t after = in.ram_available + in.ram_back;   // free once the step is done, before the pin
+    if (after <= in.ram_kept || pin > after - in.ram_kept ||
+        in.ram_available <= in.ram_floor || pin > in.ram_available - in.ram_floor) {
         c.why = "no RAM";
         return c;
     }
@@ -90,6 +92,10 @@ KvHostChoice choose_kv_host(const KvHostInputs& in) {
     c.pin_bytes = pin;
     c.why = "host";
     return c;
+}
+
+uint64_t kv_host_keep(uint64_t guard_floor, uint64_t serve_budget, uint64_t serve_held) {
+    return guard_floor + (serve_budget - std::min(serve_budget, serve_held));
 }
 
 int64_t kv_host_cells(int64_t need, int64_t max_new, int64_t slack, int64_t grid, int64_t max_cells) {
@@ -108,7 +114,9 @@ KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells) {
         p.why = "host";
         return p;
     }
-    const KvHostChoice c = choose_kv_host(in);
+    KvHostInputs beside = in;
+    if (pool_cells > 0) beside.ram_back = 0;
+    const KvHostChoice c = choose_kv_host(beside);
     p.why = c.why;
     if (c.host) {
         p.host = true;
