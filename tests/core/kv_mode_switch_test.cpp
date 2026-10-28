@@ -149,6 +149,24 @@ int run(int fmt) {
                 ++bad;
             }
         }
+        // a parked conversation deeper than the pool held: valid for the state (admission grows the pool before the
+        // restore), restored only once the pool holds it
+        c::ConversationKv deep;
+        const int64_t deep_upto = pos == grow_at ? pool.cells() + 1024 : 0;
+        bool deep_early = false;
+        if (pos == grow_at) {
+            std::string verr, rerr;
+            if (!st.kv_arena->map(deep_upto + 4096, err) || !c::conversation_kv_save(deep, ref, g, deep_upto, true, err)) {
+                std::fprintf(stderr, "%s: deep snapshot: %s\n", name, err.c_str());
+                return 1;
+            }
+            const bool valid = c::conversation_kv_validate(deep, st, g, deep_upto, true, verr);
+            deep_early = c::conversation_kv_restore(deep, st, g, deep_upto, true, rerr);
+            std::printf("  %s: a %lld-cell snapshot beside a %lld-cell pool: validate %s, restore %s\n", name,
+                        (long long) deep_upto, (long long) pool.cells(), valid ? "ok" : verr.c_str(),
+                        deep_early ? "ran (wrong)" : rerr.c_str());
+            if (!valid || deep_early || rerr.find("host pool") == std::string::npos) ++bad;
+        }
         if (pos == grow_at) {   // 1 -> 1: a larger pool, the cells moved over in host memory
             if (!pool2.reserve(ss, g, N + 64, err) || !pool2.copy_from(pool, pos, err) ||
                 !c::session_kv_set_mode(ss, g, 1, &pool2, pos, nullptr, err)) {
@@ -156,6 +174,11 @@ int run(int fmt) {
                 return 1;
             }
             pool.release();
+            // the pool now holds the deep snapshot (its cells past `pos` are rewritten as the run goes on)
+            if (!c::conversation_kv_restore(deep, st, g, deep_upto, true, err)) {
+                std::fprintf(stderr, "  %s: deep snapshot restore after the pool grew: %s\n", name, err.c_str());
+                ++bad;
+            }
         }
         if (pos == back_at) {   // 1 -> 0: uncap, back the depth, copy the cells in
             cn = k::kv_stream_counters(st.map);
