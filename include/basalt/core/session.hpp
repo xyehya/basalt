@@ -119,7 +119,8 @@ bool session_kv_unmap(SessionState& s, int64_t cells, std::string& err);
 /// switch in place.  `session_kv_mode`: the layers' kv_mode (0 or 1; -1 when they differ or `s` has none).
 /// `session_kv_cap` caps or uncaps every layer's K/V arrays (qsa_state_kv_cap).  `session_kv_set_mode` switches every
 /// layer (qsa_state_set_mode) keeping the first `live_cells` cells, streamed from `pool` when `mode` is 1; on `stream`,
-/// which it waits for.  On failure the layers already switched are switched back.
+/// which it waits for.  On failure the layers already switched are switched back.  No other stream may be working on
+/// the session: the engine drains the device first and passes null (the legacy default stream).
 bool session_kv_can_stream(const SessionState& s);
 int session_kv_mode(const SessionState& s);
 void session_kv_cap(SessionState& s, bool capped);

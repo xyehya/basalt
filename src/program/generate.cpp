@@ -6788,16 +6788,14 @@ int main(int argc, char** argv) {
         // The resident RAM mode holds only the experts no slot holds, so an expert in a slot about to go has no RAM
         // copy: it is copied from its slot into a RAM home first and read from there like the compact copy's.  Refused
         // (nothing copied) when the RAM above the floor cannot take them.  `live`: the slots that stay.
-        auto home_given_up = [&](int64_t live, std::string& e) -> bool {
-            if (!src.complement_ready()) return true;
+        // the experts in the slots about to go (`live` slots stay) that have no RAM copy, and their slots
+        auto homes_wanted = [&](int64_t live, std::vector<std::pair<int32_t, int32_t>>& give, std::vector<int32_t>& slots) {
             // the slots the loan will overwrite keep a RAM copy too, so a prompt never costs a file read
             int64_t from = live;
             if (!pf_parts.empty() && pf_parts[0].first >= 0) {
                 int64_t c = 0;
                 from = std::min<int64_t>(live, loan_plan(live, c));
             }
-            std::vector<std::pair<int32_t, int32_t>> give;
-            std::vector<int32_t> slots;
             for (size_t i = 0; i < host_res.size(); ++i) {
                 const int64_t layer = (int64_t) i / g.n_expert, ex = (int64_t) i % g.n_expert;
                 if (host_res[i] >= from && !src.has_resident(layer, ex)) {
@@ -6805,6 +6803,12 @@ int main(int argc, char** argv) {
                     slots.push_back(host_res[i]);
                 }
             }
+        };
+        auto home_given_up = [&](int64_t live, std::string& e) -> bool {
+            if (!src.complement_ready()) return true;
+            std::vector<std::pair<int32_t, int32_t>> give;
+            std::vector<int32_t> slots;
+            homes_wanted(live, give, slots);
             if (give.empty()) return true;
             std::vector<uint8_t*> dst;
             if (!src.homes_take(give, e, dst)) return false;
@@ -7134,9 +7138,13 @@ int main(int argc, char** argv) {
         // from it).  `kv_host_admit`: 1 admitted (in either mode), 0 refused (`e`, the engine stays up), -1 failed.
         // by default only beside the experts' RAM copy: with a file mapping the pin would take the file cache's RAM
         const bool kv_host_ram_copy = srcp == &src && src.complement_ready();
-        const bool kv_host_live = kv_host_on && basalt::core::session_kv_can_stream(ss) && (kv_host_forced || kv_host_ram_copy);
-        if (kv_host_on && kv_host_forced && !kv_host_live)
-            basalt::log::warn("basalt serve", "host K/V is off: the session's KV cannot stream");
+        // and only with a cache loan: a streamed prompt read stages the K/V through it
+        const char* kv_host_why = !basalt::core::session_kv_can_stream(ss) ? "the session's KV cannot stream"
+                                : pf_parts.empty() || pf_parts[0].first < 0 ? "the prompt path lends no cache slots"
+                                : nullptr;
+        const bool kv_host_live = kv_host_on && kv_host_why == nullptr && (kv_host_forced || kv_host_ram_copy);
+        if (kv_host_on && kv_host_forced && kv_host_why != nullptr)
+            basalt::log::warn("basalt serve", "host K/V is off: %s; every request keeps its K/V in VRAM", kv_host_why);
         // a request that starts decoding below this depth (cells) decodes faster from the elastic tail than streamed
         const int64_t kv_host_cross = (int64_t) basalt::core::exp_flag("kv_host_cross", 99328);
         // a test's stand-in for the RAM free now, MiB (forces the fallback); negative: MemAvailable
@@ -7156,8 +7164,8 @@ int main(int argc, char** argv) {
                                  "kept free", (long long) kv_floor, (long long) kv_host_cross,
                          (double) kv_host_kept() / 1073741824.0);
         basalt::core::KvHostPool kv_pool;
-        // the output cells a pool is pinned for (and its slack, at most 4096); a request that writes past its pool grows
-        // it between windows.  A test pins less to cross it.
+        // the output cells a pool is pinned for, and its slack (no more than one page of output); a request that writes
+        // past its pool grows it between windows.  A test pins less to cross it.
         const int64_t kv_host_out = std::max<int64_t>(0, (int64_t) basalt::core::exp_flag("kv_host_out", 16384));
         auto kv_host_pin_cells = [&](int64_t at, int64_t new_tokens) {
             return basalt::program::kv_host_cells(at, std::min<int64_t>(std::max<int64_t>(new_tokens, 0), kv_host_out),
@@ -7196,6 +7204,19 @@ int main(int argc, char** argv) {
             relend();   // the prompt path's layout follows the mode (no staging pool in VRAM)
             return 1;
         };
+        // the RAM homes the request's loan takes at its admission (loan_homes below), with the cache as it is now
+        auto loan_home_bytes = [&]() -> uint64_t {
+            int64_t c = 0;
+            if (kv_tail_copies || kv_floor <= 0 || lend_from <= 0 || pf_parts.empty() || pf_parts[0].first < 0 ||
+                !src.complement_ready() || loan_plan(xcache.slots(), c) >= lend_from)
+                return 0;
+            std::vector<std::pair<int32_t, int32_t>> give;
+            std::vector<int32_t> slots;
+            homes_wanted(xcache.slots(), give, slots);
+            uint64_t bytes = 0;
+            for (const auto& x : give) bytes += (uint64_t) basalt::kernels::cpu::expert_layout().blob_bytes(x.first);
+            return bytes;
+        };
         // set by kv_host_admit for a shallow request on a streamed session: it goes back to the VRAM tail with the cells
         // it keeps once the outgoing conversation is parked (kv_host_back)
         bool kv_host_late = false;
@@ -7217,6 +7238,7 @@ int main(int argc, char** argv) {
                                 (uint64_t) std::max<int64_t>(cells, 1);
             in.ram_available = kv_ram_now();
             in.ram_kept = kv_host_kept();
+            in.ram_low = basalt::platform::ram_guard_level() != basalt::platform::RamLevel::Ok;
             const basalt::program::KvHostPlan plan = basalt::program::plan_kv_host(in, kv_pool.valid() ? kv_pool.cells() : 0);
             const auto t0 = Clock::now();
             auto said = [&](const char* what) {
@@ -7240,6 +7262,7 @@ int main(int argc, char** argv) {
                 return 1;
             case basalt::program::KvHostAct::take: {
                 if (!kv_drain(e)) return -1;
+                const uint64_t homes0 = src.homes_bytes();
                 if (!kv_pool.reserve(ss, g, plan.cells, pe) ||
                     !basalt::core::session_kv_set_mode(ss, g, 1, &kv_pool, live_c, nullptr, pe)) {
                     kv_pool.release();
@@ -7248,9 +7271,30 @@ int main(int argc, char** argv) {
                 }
                 // the K/V past the slot pool goes back to the expert cache
                 if (!basalt::core::session_kv_unmap(ss, std::min<int64_t>(std::max(kv_floor, at + kKvGrowCells), ss.max_cells), e) ||
-                    !cache_regrow(e) || !ver.sync_kv_mode(e) || !ver.warm_session(&ss, e))
+                    !cache_regrow(e) || !ver.sync_kv_mode(e))
                     return -1;
                 relend();   // the prompt path's layout follows the mode: its loan now carries the staging pool
+                // the RAM homes that loan takes next are charged, less those the take freed; short of RAM for them the
+                // request goes back to the VRAM tail
+                {
+                    const uint64_t now = src.homes_bytes(), need = loan_home_bytes();
+                    const uint64_t freed = homes0 > now ? homes0 - now : 0;
+                    basalt::program::KvHostInputs got = in;
+                    got.ram_kept += need > freed ? need - freed : 0;
+                    if (got.ram_kept > in.ram_kept && !basalt::program::choose_kv_host(got).host) {
+                        const int r = kv_host_to_vram(at, live_c, pe, e);
+                        if (r < 0) return -1;
+                        if (r > 0) {
+                            basalt::log::info("basalt serve", "host K/V: kept in VRAM (no RAM for the loan's RAM homes), "
+                                                 "%lld cells, %.0f MiB of homes, %.2f GiB free, %.2f GiB kept free",
+                                         (long long) cells, (double) (need - freed) / 1048576.0,
+                                         (double) in.ram_available / 1073741824.0, (double) got.ram_kept / 1073741824.0);
+                            return 1;
+                        }
+                        basalt::log::warn("basalt serve", "host K/V: %s; the request streams from the pool it has", pe.c_str());
+                    }
+                }
+                if (!ver.warm_session(&ss, e)) return -1;
                 said("streamed");
                 return 1;
             }
@@ -7270,7 +7314,7 @@ int main(int argc, char** argv) {
                 const int r = kv_host_to_vram(at, live_c, pe, e);
                 if (r < 0) return -1;
                 if (r == 0) {
-                    if (kv_pool.cells() >= cells) {   // the pool still covers the request: it stays streamed
+                    if (basalt::program::kv_host_pool_serves(kv_pool.cells(), at, kKvWindowCells)) {   // it stays streamed
                         basalt::log::warn("basalt serve", "host K/V: %s; the request streams from the pool it has", pe.c_str());
                         return 1;
                     }
@@ -7309,7 +7353,8 @@ int main(int argc, char** argv) {
             const int64_t cells = kv_host_pin_cells(need, left);
             const uint64_t bytes = basalt::core::KvHostPool::bytes_for(ss, g, cells);
             const uint64_t avail = kv_host_grow_ram >= 0 ? (uint64_t) kv_host_grow_ram << 20 : kv_ram_now();
-            const uint64_t floor = guard_floor + (256ull << 20);   // as the RAM homes leave it
+            // the keep admission uses (it is never below the RAM homes' floor)
+            const uint64_t floor = std::max<uint64_t>(guard_floor + (256ull << 20), kv_host_kept());
             auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
             std::string pe = cells <= had ? "the context is full" : "no RAM";
             if (cells > had && avail > floor && bytes <= avail - floor) {
@@ -8860,6 +8905,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 slot_held = SlotHeld{};
+                if (incoming) (void) conversations.put(std::move(*incoming));   // the conversation it would continue
                 basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, err.c_str());
                 std::printf("ERR %s\n", err.c_str());
                 std::fflush(stdout);
@@ -8901,8 +8947,10 @@ int main(int argc, char** argv) {
                 }
             }
             if (!kv_ok && kv_short) {
-                // declined: the engine stays up, the solo session and its bookkeeping as they were
+                // declined: the engine stays up, the solo session and its bookkeeping as they were, the conversation it
+                // would continue back in the cache
                 slot_held = SlotHeld{};
+                if (incoming) (void) conversations.put(std::move(*incoming));
                 basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, err.c_str());
                 std::printf("ERR %s\n", err.c_str());
                 std::fflush(stdout);
@@ -11033,7 +11081,8 @@ int main(int argc, char** argv) {
                                      "%.1f MB read", (long long) req_hits, (long long) src.ram_reads(),
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6);
             if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
-                // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
+                // KV streaming since the residency map was last reset (a mode switch, a restore, a new conversation):
+                // blocks the selections named vs blocks read from RAM
                 // (this device's owned ordinals; a split's other stages hold theirs)
                 uint64_t miss = 0, look = 0;
                 bool over = false;

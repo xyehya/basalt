@@ -105,7 +105,7 @@ int64_t kv_host_cells(int64_t need, int64_t max_new, int64_t slack, int64_t grid
 KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells) {
     KvHostPlan p;
     const bool deep = in.cells > 0 && in.bytes_per_cell > 0 && in.cells >= in.crossover_cells;
-    if (pool_cells > 0 && deep && pool_cells >= in.cells) {
+    if (pool_cells > 0 && deep && pool_cells >= in.cells && !in.ram_low) {
         p.host = true;
         p.act = KvHostAct::keep;
         p.cells = pool_cells;
@@ -123,6 +123,10 @@ KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells) {
     }
     p.act = pool_cells > 0 ? KvHostAct::drop : KvHostAct::none;
     return p;
+}
+
+bool kv_host_pool_serves(int64_t pool_cells, int64_t at, int64_t window) {
+    return pool_cells > 0 && pool_cells >= std::max<int64_t>(at, 0) + std::max<int64_t>(window, 0);
 }
 
 const char* kv_host_act_name(KvHostAct a) {

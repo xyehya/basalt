@@ -188,7 +188,7 @@ int main() {
         in.cells = 40 * 1024;                       // a shallow request after a deep one: back to VRAM, pool freed
         p = plan_kv_host(in, 144 * 1024);
         CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "shallow");
-        in.crossover_cells = 0;                     // a forced host mode (crossover 0): every request that fits streams
+        in.crossover_cells = 0;                     // exp kv_host_cross=0: every request that fits streams
         CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
         CHECK_STR(kv_host_act_name(KvHostAct::grow), "grow");
     }
@@ -212,6 +212,27 @@ int main() {
         in.ram_kept = kv_host_keep(guard, budget, 400 * M);      // not enough of it held
         CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
         CHECK(plan_kv_host(in, 98304).act == KvHostAct::drop);   // nor for a larger pool beside the one held
+    }
+    {   // a pool held is given back when the RAM guard is below its floor, even when it covers the request
+        KvHostInputs in;
+        in.crossover_cells = 99328;
+        in.cells = 131072;
+        in.bytes_per_cell = 12963;
+        in.ram_available = 8 * G;
+        in.ram_kept = 5 * G;
+        CHECK(plan_kv_host(in, 147456).act == KvHostAct::keep);
+        in.ram_low = true;
+        in.ram_available = 3 * G;
+        const KvHostPlan p = plan_kv_host(in, 147456);
+        CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "no RAM");
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
+    }
+    {   // a pool that cannot grow still serves a request when it holds the prompt and the next decode window
+        CHECK(kv_host_pool_serves(131072, 120000, 2112));
+        CHECK(kv_host_pool_serves(131072, 128960, 2112));
+        CHECK(!kv_host_pool_serves(131072, 128961, 2112));
+        CHECK(!kv_host_pool_serves(0, 0, 2112));
+        CHECK(!kv_host_pool_serves(98304, 120000, 2112));   // the case admission's drop path refused before: smaller
     }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");
