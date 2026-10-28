@@ -133,6 +133,133 @@ int main() {
         in.floor_bytes = 100 * G;
         CHECK(choose_auto(in).resident_gb == 0.0);
     }
+    // Per-request K/V placement: shallow requests stay in VRAM, deep ones go to host RAM when it holds them.
+    {
+        KvHostInputs in;
+        in.crossover_cells = 97 * 1024;
+        in.bytes_per_cell = 12963;                  // ~12.66 KB per cell
+        in.ram_available = 8 * G;
+        in.ram_kept = 5 * G;                        // 3 GiB for the pin
+        in.cells = 40 * 1024;
+        KvHostChoice c = choose_kv_host(in);
+        CHECK(!c.host && std::string(c.why) == "shallow" && c.pin_bytes == 0);
+        in.cells = 131 * 1024;                      // 1.62 GiB
+        c = choose_kv_host(in);
+        CHECK(c.host && std::string(c.why) == "host" && c.pin_bytes == (uint64_t) in.cells * in.bytes_per_cell);
+        in.cells = 262 * 1024;                      // 3.24 GiB: more than the 3 GiB left
+        c = choose_kv_host(in);
+        CHECK(!c.host && std::string(c.why) == "no RAM");
+        in.cells = (int64_t) ((3 * G) / in.bytes_per_cell);   // exactly what fits
+        CHECK(choose_kv_host(in).host);
+        in.ram_kept = 9 * G;                        // the kept RAM above what is free: no underflow
+        CHECK(!choose_kv_host(in).host);
+        in = KvHostInputs{};                        // nothing known: VRAM
+        CHECK(!choose_kv_host(in).host);
+    }
+    {   // the request's pin: prompt or resumed snapshot, new tokens, slack, on the grid, at most the context
+        CHECK(kv_host_cells(100000, 1024, 4096, 16384, 262144) == 114688);
+        CHECK(kv_host_cells(100000, 0, 0, 0, 262144) == 100000);
+        CHECK(kv_host_cells(260000, 8192, 4096, 16384, 262144) == 262144);
+        CHECK(kv_host_cells(-5, -1, 0, 4096, 0) == 0);
+    }
+    {   // the host K/V's lifetime across requests
+        KvHostInputs in;
+        in.crossover_cells = 97 * 1024;
+        in.bytes_per_cell = 12963;
+        in.ram_available = 8 * G;
+        in.ram_kept = 5 * G;                        // 3 GiB for a new pin
+        in.cells = 40 * 1024;                       // shallow, nothing held: the VRAM tail
+        KvHostPlan p = plan_kv_host(in, 0);
+        CHECK(!p.host && p.act == KvHostAct::none && p.cells == 0 && p.pin_bytes == 0);
+        in.cells = 131 * 1024;                      // deep, fits: take a pool
+        p = plan_kv_host(in, 0);
+        CHECK(p.host && p.act == KvHostAct::take && p.cells == in.cells && p.pin_bytes == (uint64_t) in.cells * in.bytes_per_cell);
+        p = plan_kv_host(in, 144 * 1024);           // the pool held covers it: kept, nothing more pinned
+        CHECK(p.host && p.act == KvHostAct::keep && p.cells == 144 * 1024 && p.pin_bytes == 0);
+        in.ram_available = 5 * G;                   // ... even when the RAM is short now
+        CHECK(plan_kv_host(in, 144 * 1024).act == KvHostAct::keep);
+        in.ram_available = 8 * G;
+        in.cells = 200 * 1024;                      // deeper than the pool: a larger one beside it
+        p = plan_kv_host(in, 144 * 1024);
+        CHECK(p.host && p.act == KvHostAct::grow && p.cells == in.cells);
+        in.ram_available = 6 * G;                   // the larger one does not fit: back to the VRAM tail
+        p = plan_kv_host(in, 144 * 1024);
+        CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "no RAM");
+        in.cells = 40 * 1024;                       // a shallow request after a deep one: back to VRAM, pool freed
+        p = plan_kv_host(in, 144 * 1024);
+        CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "shallow");
+        in.crossover_cells = 0;                     // exp kv_host_cross=0: every request that fits streams
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        CHECK_STR(kv_host_act_name(KvHostAct::grow), "grow");
+    }
+    {   // what a pin leaves free: the guard and the serving budget still to come
+        const uint64_t M = 1ull << 20;
+        CHECK(kv_host_keep(3 * G, 2 * G, 0) == 5 * G);
+        CHECK(kv_host_keep(3 * G, 2 * G, 512 * M) == 5 * G - 512 * M);
+        CHECK(kv_host_keep(3 * G, 2 * G, 9 * G) == 3 * G);      // held past the budget: never below the guard
+        CHECK(kv_host_keep(3 * G, 0, 1 * G) == 3 * G);
+        // a 131K turn deep in a session: 1.93 GiB to pin, 6.63 GiB free, guard 3.09 GiB, budget 2.13 GiB
+        KvHostInputs in;
+        in.crossover_cells = 99328;
+        in.cells = 163840;
+        in.bytes_per_cell = (uint64_t) (1.93 * (double) G) / (uint64_t) in.cells;
+        in.ram_available = (uint64_t) (6.63 * (double) G);
+        const uint64_t guard = (uint64_t) (3.09 * (double) G), budget = (uint64_t) (2.13 * (double) G);
+        in.ram_kept = kv_host_keep(guard, budget, 0);
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::none);       // the whole budget kept: stays in VRAM
+        in.ram_kept = kv_host_keep(guard, budget, 600 * M);      // 600 MiB of it already held
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        in.ram_kept = kv_host_keep(guard, budget, 400 * M);      // not enough of it held
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
+        CHECK(plan_kv_host(in, 98304).act == KvHostAct::drop);   // nor for a larger pool beside the one held
+    }
+    {   // a pool held is given back when the RAM guard is below its floor, even when it covers the request
+        KvHostInputs in;
+        in.crossover_cells = 99328;
+        in.cells = 131072;
+        in.bytes_per_cell = 12963;
+        in.ram_available = 8 * G;
+        in.ram_kept = 5 * G;
+        CHECK(plan_kv_host(in, 147456).act == KvHostAct::keep);
+        in.ram_low = true;
+        in.ram_available = 3 * G;
+        const KvHostPlan p = plan_kv_host(in, 147456);
+        CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "no RAM");
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::none);
+    }
+    {   // a deep request that reads a long fresh prompt stays in the VRAM tail; a short read (a continuation) streams,
+        // and a session already streamed keeps streaming whatever it reads
+        KvHostInputs in;
+        in.crossover_cells = 99328;
+        in.cells = 147456;
+        in.bytes_per_cell = 12963;
+        in.ram_available = 9 * G;
+        in.ram_kept = 5 * G;
+        in.fresh_cells = 32768;
+        in.read_cells = 131072;
+        KvHostPlan p = plan_kv_host(in, 0);
+        CHECK(!p.host && p.act == KvHostAct::none && std::string(p.why) == "fresh");
+        in.read_cells = 2000;
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        in.read_cells = 32768;
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        in.read_cells = 131072;
+        CHECK(plan_kv_host(in, 163840).act == KvHostAct::keep);
+        in.cells = 180224;                          // deeper than the pool held: a larger one, not the VRAM tail
+        CHECK(plan_kv_host(in, 163840).act == KvHostAct::grow);
+        in.cells = 40960;                           // shallow: as before
+        CHECK(std::string(plan_kv_host(in, 0).why) == "shallow");
+        in.cells = 147456;
+        in.fresh_cells = 0;                         // no limit
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+    }
+    {   // a pool that cannot grow still serves a request when it holds the prompt and the next decode window
+        CHECK(kv_host_pool_serves(131072, 120000, 2112));
+        CHECK(kv_host_pool_serves(131072, 128960, 2112));
+        CHECK(!kv_host_pool_serves(131072, 128961, 2112));
+        CHECK(!kv_host_pool_serves(0, 0, 2112));
+        CHECK(!kv_host_pool_serves(98304, 120000, 2112));   // the case admission's drop path refused before: smaller
+    }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");
     return 0;

@@ -35,6 +35,24 @@ below the slots a prompt chunk needs: a request whose KV would take it there, ev
 the cells they do not hold, is refused with that error, and a reply that grows past it ends with it (a `--parallel`
 slot ends as at its length limit); the engine keeps running.
 
+A request that starts decoding at 99328 tokens or deeper keeps its K/V in pinned RAM instead (the host K/V): attention
+reads it through a VRAM pool of 32768 cells, so the cache keeps its tail slots. A conversation switches at a turn that
+reads at most 32768 new prompt tokens (a continuation); a turn that reads a longer prompt stays in VRAM, since a long
+streamed read costs more than its decode wins back, and the conversation's next turn switches. The pin covers the
+prompt, up to 16384 new tokens and 4096 more, on a 16384-cell grid; a reply that outgrows it gets a pool for its next
+16384 tokens between two decode windows, or goes back to the VRAM tail when the RAM is short. The next shallower
+request goes back to the VRAM tail too, and so does a streamed session when a request arrives with the RAM below the
+guard's floor (the pin is freed). A pin, and each larger one, is taken only when it leaves the RAM guard's floor free
+plus what serving can still take (its budget less the checkpoints and parked conversations held now) and the RAM copies
+the prompt path's loan then needs; otherwise the request keeps its K/V in VRAM (`host K/V: kept in VRAM ...`). It is
+on by default with one GPU, the experts' RAM copy, a prompt path that lends cache slots and a KV other than `k8v4`; not
+with `--parallel`, a layer split, `--kv-resident` or `--vram-elastic`, where the K/V stays in VRAM.
+`"exp": "kv_host=0"` in the config's `engine` section turns it off. A streamed request decodes as from the VRAM tail
+at the same expert placement; its prompt read lends a few more cache slots (the staging pool), which can move the last
+bits of a short read's K/V, and the freed VRAM holds more experts, so in serving the text can differ
+([precision](precision/index.md)). Until a request streams, the VRAM, the expert cache and the
+prompt chunks are what they are with it off.
+
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
 share of its experts. Its first token so comes about as soon as on an idle engine. A longer prompt is read beside them:
@@ -172,7 +190,8 @@ Basalt refuses settings that would leave the machine without memory, and never s
   is read from the SSD). Below it, the engine drops its parked conversations (except the one the next request
   continues) and returns its free heap to the OS, and a request that arrives waits up to 30 s for the RAM to come back
   before it starts; one that adds at most 256 tokens to the live conversation (the server's wrap-up after a thinking
-  budget) does not wait. A running request continues; it
+  budget) does not wait. A request cancelled during the wait ends there, before anything moves for it. A running
+  request continues; it
   stops with an error only when the RAM is critical: under 1 GiB free, or below the guard while the kernel's memory
   pressure (`/proc/pressure/memory`, avg10) shows tasks stalled most of the time (some >= 60% or full >= 40%). Without
   a pressure reading (Windows, or a kernel without PSI) below the guard is critical. The error (`RAM low (... free <
