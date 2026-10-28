@@ -7170,10 +7170,19 @@ int main(int argc, char** argv) {
             kv_pool.release();
             return 1;
         };
+        // set by kv_host_admit for a shallow request on a streamed session: it goes back to the VRAM tail with the cells
+        // it keeps once the outgoing conversation is parked (kv_host_back)
+        bool kv_host_late = false;
         auto kv_host_admit = [&](int64_t need, int64_t new_tokens, int64_t live_cells, std::string& e) -> int {
+            kv_host_late = false;
             if (!kv_host_live) return 1;
             const int64_t live_c = std::min<int64_t>(std::max<int64_t>(live_cells, 0), ss.max_cells);
             const int64_t at = std::max(need, live_c);
+            // shallow (the depth it starts decoding at): the VRAM tail (a streamed session moves there after the park)
+            if (need < kv_host_cross) {
+                kv_host_late = kv_pool.valid();
+                return 1;
+            }
             const int64_t cells = kv_host_pin_cells(at, new_tokens);
             basalt::program::KvHostInputs in;
             in.cells = cells;
@@ -7244,6 +7253,22 @@ int main(int argc, char** argv) {
                 return 1;
             }
             }
+            return 1;
+        };
+        // the shallow request's switch (kv_host_late), after the park: back to the VRAM tail with the first `keep` cells,
+        // the arrays backed for `need`.  1 done or still streamed, -1 failed (`e`).
+        auto kv_host_back = [&](int64_t need, int64_t keep, std::string& e) -> int {
+            const auto t0 = Clock::now();
+            if (!kv_drain(e)) return -1;
+            std::string pe;
+            const int r = kv_host_to_vram(need, keep, pe, e);
+            if (r < 0) return -1;
+            if (r == 0)
+                basalt::log::warn("basalt serve", "host K/V: %s; the request streams from the pool it has", pe.c_str());
+            else
+                basalt::log::info("basalt serve", "host K/V: back to VRAM (shallow), %lld cells kept, the expert cache %lld "
+                                     "slots, in %.1f ms", (long long) keep, (long long) xcache.slots(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             return 1;
         };
         // a streamed request about to write past its pool (between windows, at position `p` with `left` tokens to go,
@@ -8800,6 +8825,7 @@ int main(int argc, char** argv) {
             // the live conversation's, which its checkpoints (no K/V of their own) are prefixes of
             int64_t kv_live = (int64_t) live.size();
             for (const ConvCheckpoint& c : checks) kv_live = std::max<int64_t>(kv_live, (int64_t) c.ids.size());
+            kv_host_late = false;
             if (const int adm = in_slot ? 1 : kv_host_admit(kv_need, max_new, kv_live, err); adm <= 0) {
                 if (adm < 0) {
                     std::printf("ERR %s\n", err.c_str());
@@ -8881,17 +8907,21 @@ int main(int argc, char** argv) {
             }
             // the tail without RAM copies: the loan follows the cache's end down as the KV grows, so the experts it
             // reaches below the copies' region take a home before the prompt is read
-            int64_t loan_chunk = 0;
-            if (!kv_tail_copies && kv_floor > 0 && !in_slot && lend_from > 0 && !pf_parts.empty() &&
-                pf_parts[0].first >= 0 && loan_plan(xcache.slots(), loan_chunk) < lend_from) {
-                if (!kv_drain(err)) {
-                    std::printf("ERR %s\n", err.c_str());
-                    return 1;
+            auto loan_homes = [&]() -> bool {
+                int64_t loan_chunk = 0;
+                if (!kv_tail_copies && kv_floor > 0 && !in_slot && lend_from > 0 && !pf_parts.empty() &&
+                    pf_parts[0].first >= 0 && loan_plan(xcache.slots(), loan_chunk) < lend_from) {
+                    if (!kv_drain(err)) return false;
+                    std::string he;
+                    if (!home_given_up(xcache.slots(), he))
+                        basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy "
+                                             "(%s): the prompt reads them from the file", he.c_str());
                 }
-                std::string he;
-                if (!home_given_up(xcache.slots(), he))
-                    basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the loan's experts without a copy (%s): "
-                                         "the prompt reads them from the file", he.c_str());
+                return true;
+            };
+            if (!loan_homes()) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
             }
             if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
@@ -9005,6 +9035,15 @@ int main(int argc, char** argv) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
+            // the host K/V: a shallow request on a streamed session goes back to the VRAM tail with the cells it keeps,
+            // now that the outgoing conversation is parked
+            if (kv_host_late) {
+                kv_host_late = false;
+                if (kv_host_back(kv_need, resume, err) < 0 || !loan_homes()) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+            }
             if (resume == 0) {
                 basalt::core::session_zero(*rsp, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
