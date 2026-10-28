@@ -438,7 +438,7 @@ execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
 # the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
 add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp src/program/community_row.cpp src/program/host_rates.cpp
-            src/program/gpu_select.cpp src/program/multi_gpu_plan.cpp)
+            src/program/gpu_select.cpp src/program/multi_gpu_plan.cpp src/program/image_loan.cpp)
 target_include_directories(engine_session PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(engine_session PUBLIC platform Threads::Threads)
@@ -958,6 +958,11 @@ basalt_cpu_test(NAME probe_derive_test COMMAND probe_derive_test)
 set_tests_properties(probe_derive_test PROPERTIES TIMEOUT 60)
 
 # the start-up picks for settings left out: the rules and the printed line (CPU only)
+add_executable(image_loan_test tests/program/image_loan_test.cpp)
+target_link_libraries(image_loan_test PRIVATE engine_session warnings)
+basalt_embed_manifest(image_loan_test)
+basalt_cpu_test(NAME image_loan_test COMMAND image_loan_test)
+set_tests_properties(image_loan_test PROPERTIES TIMEOUT 60)
 add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
 target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(auto_plan_test)
@@ -1047,6 +1052,10 @@ if(BUILD_TESTING)
   add_executable(bf16_bits_test tests/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)
   basalt_cpu_test(NAME bf16_bits_test COMMAND bf16_bits_test)
+  # the prompt path's stream-all chunk size priced from the link (header-only, CPU)
+  add_executable(stream_all_test tests/prefill/stream_all_test.cpp)
+  target_include_directories(stream_all_test PRIVATE include)
+  basalt_cpu_test(NAME stream_all_test COMMAND stream_all_test)
 endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

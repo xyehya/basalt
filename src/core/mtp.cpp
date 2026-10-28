@@ -536,7 +536,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int head_type, int64_t 
 
 namespace {
 // What to change when the draft head's token subset does not fit the VRAM left.  Text only, after the failure.
-void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
+void draft_head_hint(int64_t n_tokens, uint64_t bytes) {
     size_t free_b = 0, total_b = 0;
     const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
     std::string free_s;
@@ -546,7 +546,7 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
         free_s = b;
     }
     basalt::log::warn("basalt mtp", "the draft head over %lld tokens needs %.0f MiB of VRAM%s.",
-                 (long long) n_tokens, (double) (n_tokens * row_bytes) / 1048576.0, free_s.c_str());
+                 (long long) n_tokens, (double) bytes / 1048576.0, free_s.c_str());
     basalt::log::info("basalt mtp", "hint: a smaller draft vocabulary (--draft-vocab when converting the model), "
                          "a smaller --max-context, or closing what else uses the GPU leaves it room.");
 }
@@ -613,7 +613,13 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 (!mapped && cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) ||
                 (n_xcap_ > 0 && cudaMalloc((void**) &dxids_, (size_t) n_xcap_ * 4) != cudaSuccess)) {
                 err = "mtp: the draft head does not fit";
-                draft_head_hint(n_dvocab_, mapped ? (int64_t) sizeof(int32_t) : row_bytes);
+                // the map, the copy unless mapped, the context rows' ids and the leading rows' 2-bit copy
+                uint64_t need = map.size() * 4 + (uint64_t) n_xcap_ * 4;
+                if (!mapped) need += (uint64_t) (n_dvocab_ * row_bytes);
+                if (head->type() == 13 || head->type() == 14)
+                    need += basalt::kernels::q5k_proxy_bytes(n_base + n_xcap_) +
+                            basalt::kernels::q5k_proxy_scratch_bytes(n_base + n_xcap_);
+                draft_head_hint(n_dvocab_, need);
                 return false;
             }
             rows_mapped_ = mapped;
@@ -979,10 +985,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             q5k_head_top1(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, sub ? dvocab_ : nullptr,
                           out_ids_, probs_, top_scratch_, cs))
             return true;
-        if (rows_mapped_) {   // the subset's rows of the main head: the bits of the copy's rows
-            if (T != 1) { err = "mtp: a draft head read through its row map takes one row"; return false; }
+        if (rows_mapped_)   // the subset's rows of the main head, one row a step: the bits of the copy's rows
             native_q6_k_mmvq_rows(head_->weights(), dvocab_, xq_, head_logits_, (int) N, (int) nv, cs);
-        } else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
+        else if (head_->type() == 13 && q5k_head_supported((int) N, T))   // the same bits
             q5k_head_mmvq(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         else if (head_->type() == GGML_Q8_0 && T == 1)   // read once a step: streamed past the layer's other weights
             native_q8_0_mmvq_stream(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, cs);
@@ -1574,7 +1579,6 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
     decode_gaps().mark(10);
     ms_draft += ms_since(t0);
     ++rounds;
-    if (tier_ != 0) ++rounds_added;
     return true;
 }
 
