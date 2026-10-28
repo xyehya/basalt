@@ -43,7 +43,8 @@ when it leaves the RAM guard's floor free plus what serving can still take (its 
 conversations held now); otherwise the request keeps its K/V in VRAM (`host K/V: kept in VRAM (no RAM) ...`). It is on
 by default with one GPU, the experts' RAM copy and a KV other than `k8v4`; not with `--parallel`, a layer split,
 `--kv-resident` or `--vram-elastic`, where the K/V stays in VRAM.
-`"exp": "kv_host=0"` in the config's `engine` section turns it off. Streaming a request's K/V does not change its output.
+`"exp": "kv_host=0"` in the config's `engine` section turns it off. Streaming a request's K/V does not change its output,
+and until a request streams, the VRAM, the expert cache and the prompt chunks are what they are with it off.
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
