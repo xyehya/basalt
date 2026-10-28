@@ -80,6 +80,33 @@ struct KvHostChoice {
 
 KvHostChoice choose_kv_host(const KvHostInputs& in);
 
+/// The cells a request's host K/V is pinned for: the longer of its prompt and the snapshot it resumes (`need`), its
+/// new tokens and `slack`, rounded up to `grid` cells so a conversation that grows a little keeps its pool, at most
+/// `max_cells`.
+int64_t kv_host_cells(int64_t need, int64_t max_new, int64_t slack, int64_t grid, int64_t max_cells);
+
+/// What a request's admission does with the session's host K/V.
+enum class KvHostAct {
+    none,   ///< stays in the VRAM tail, no host K/V held
+    take,   ///< pins a pool and moves the session's cells into it
+    keep,   ///< the pool held covers the request: streamed as it is
+    grow,   ///< a larger pool; the cells move over, the old one is freed
+    drop,   ///< back to the VRAM tail; the cells move back, the pool is freed
+};
+
+struct KvHostPlan {
+    bool host = false;                    ///< the request runs streamed
+    KvHostAct act = KvHostAct::none;
+    int64_t cells = 0;                    ///< the pool's cells after the step (0: none)
+    uint64_t pin_bytes = 0;               ///< RAM the step pins on top of what the session holds
+    const char* why = "";
+};
+
+/// `pool_cells`: the cells of the pool the session holds now (0: none, the session is in the VRAM tail).  A pool that
+/// covers a deep request is kept whatever the RAM is now (it is pinned already); a larger one must fit beside it.
+KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells);
+const char* kv_host_act_name(KvHostAct a);
+
 /// "auto flags: peer-exclusive off, resident 51.2 GB, pool-affinity all, pool-workers 15", only the auto-picked keys;
 /// empty when none was.
 std::string auto_flags_line(const AutoPlan& plan);

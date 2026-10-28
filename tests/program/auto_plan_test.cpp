@@ -156,6 +156,42 @@ int main() {
         in = KvHostInputs{};                        // nothing known: VRAM
         CHECK(!choose_kv_host(in).host);
     }
+    {   // the request's pin: prompt or resumed snapshot, new tokens, slack, on the grid, at most the context
+        CHECK(kv_host_cells(100000, 1024, 4096, 16384, 262144) == 114688);
+        CHECK(kv_host_cells(100000, 0, 0, 0, 262144) == 100000);
+        CHECK(kv_host_cells(260000, 8192, 4096, 16384, 262144) == 262144);
+        CHECK(kv_host_cells(-5, -1, 0, 4096, 0) == 0);
+    }
+    {   // the host K/V's lifetime across requests
+        KvHostInputs in;
+        in.crossover_cells = 97 * 1024;
+        in.bytes_per_cell = 12963;
+        in.ram_available = 8 * G;
+        in.ram_kept = 5 * G;                        // 3 GiB for a new pin
+        in.cells = 40 * 1024;                       // shallow, nothing held: the VRAM tail
+        KvHostPlan p = plan_kv_host(in, 0);
+        CHECK(!p.host && p.act == KvHostAct::none && p.cells == 0 && p.pin_bytes == 0);
+        in.cells = 131 * 1024;                      // deep, fits: take a pool
+        p = plan_kv_host(in, 0);
+        CHECK(p.host && p.act == KvHostAct::take && p.cells == in.cells && p.pin_bytes == (uint64_t) in.cells * in.bytes_per_cell);
+        p = plan_kv_host(in, 144 * 1024);           // the pool held covers it: kept, nothing more pinned
+        CHECK(p.host && p.act == KvHostAct::keep && p.cells == 144 * 1024 && p.pin_bytes == 0);
+        in.ram_available = 5 * G;                   // ... even when the RAM is short now
+        CHECK(plan_kv_host(in, 144 * 1024).act == KvHostAct::keep);
+        in.ram_available = 8 * G;
+        in.cells = 200 * 1024;                      // deeper than the pool: a larger one beside it
+        p = plan_kv_host(in, 144 * 1024);
+        CHECK(p.host && p.act == KvHostAct::grow && p.cells == in.cells);
+        in.ram_available = 6 * G;                   // the larger one does not fit: back to the VRAM tail
+        p = plan_kv_host(in, 144 * 1024);
+        CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "no RAM");
+        in.cells = 40 * 1024;                       // a shallow request after a deep one: back to VRAM, pool freed
+        p = plan_kv_host(in, 144 * 1024);
+        CHECK(!p.host && p.act == KvHostAct::drop && std::string(p.why) == "shallow");
+        in.crossover_cells = 0;                     // a forced host mode (crossover 0): every request that fits streams
+        CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
+        CHECK_STR(kv_host_act_name(KvHostAct::grow), "grow");
+    }
     if (g_fail) { std::printf("auto_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("auto_plan_test: ok\n");
     return 0;

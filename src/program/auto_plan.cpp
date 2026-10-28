@@ -92,6 +92,45 @@ KvHostChoice choose_kv_host(const KvHostInputs& in) {
     return c;
 }
 
+int64_t kv_host_cells(int64_t need, int64_t max_new, int64_t slack, int64_t grid, int64_t max_cells) {
+    int64_t c = std::max<int64_t>(need, 0) + std::max<int64_t>(max_new, 0) + std::max<int64_t>(slack, 0);
+    if (grid > 0) c = (c + grid - 1) / grid * grid;
+    return max_cells > 0 ? std::min(c, max_cells) : c;
+}
+
+KvHostPlan plan_kv_host(const KvHostInputs& in, int64_t pool_cells) {
+    KvHostPlan p;
+    const bool deep = in.cells > 0 && in.bytes_per_cell > 0 && in.cells >= in.crossover_cells;
+    if (pool_cells > 0 && deep && pool_cells >= in.cells) {
+        p.host = true;
+        p.act = KvHostAct::keep;
+        p.cells = pool_cells;
+        p.why = "host";
+        return p;
+    }
+    const KvHostChoice c = choose_kv_host(in);
+    p.why = c.why;
+    if (c.host) {
+        p.host = true;
+        p.act = pool_cells > 0 ? KvHostAct::grow : KvHostAct::take;
+        p.cells = in.cells;
+        p.pin_bytes = c.pin_bytes;
+        return p;
+    }
+    p.act = pool_cells > 0 ? KvHostAct::drop : KvHostAct::none;
+    return p;
+}
+
+const char* kv_host_act_name(KvHostAct a) {
+    switch (a) {
+        case KvHostAct::take: return "take";
+        case KvHostAct::keep: return "keep";
+        case KvHostAct::grow: return "grow";
+        case KvHostAct::drop: return "drop";
+        default: return "none";
+    }
+}
+
 std::string auto_flags_line(const AutoPlan& p) {
     std::string out;
     auto add = [&](const std::string& s) { out += out.empty() ? "auto flags: " : ", "; out += s; };
