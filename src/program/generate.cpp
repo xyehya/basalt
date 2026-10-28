@@ -7515,7 +7515,7 @@ int main(int argc, char** argv) {
         // adaptive tier rounds in the batch windows (routing counts from every row of every slot)
         const bool batch_adapt = adapt_fast && !drive.d.usage.empty();
         int64_t ba_win = 0, ba_swaps = 0, ba_rounds = 0, ba_swaps_l = 0, ba_rounds_l = 0, ba_h_l = 0, ba_m_l = 0;
-        int64_t ba_noplace0 = 0;   // xq_noplace when the batch's swap totals were last logged
+        int64_t ba_noplace = 0;   // the batch rounds' swaps deferred for want of a free RAM place
         double ba_ms = 0;
         JobRunner ba_thr;       // queues the adaptive copies beside the windows
         bool ba_job = false;
@@ -8037,8 +8037,10 @@ int main(int argc, char** argv) {
                             acted = true;
                         }
                     } else if (ba_win % o.adapt_every == 0) {
+                        const int64_t np0 = xq_noplace;
                         ok = xq_round();
                         ba_swaps += (int64_t) xq.size();
+                        ba_noplace += xq_noplace - np0;
                         ++ba_rounds;
                         acted = true;
                     }
@@ -8240,10 +8242,9 @@ int main(int argc, char** argv) {
                                          "(no free RAM place), %.3f ms/window of host time, peer swaps total %lld",
                                  (long long) ba_rounds, (long long) ba_swaps,
                                  ba_rounds > 0 ? (double) ba_swaps / (double) ba_rounds : 0.0,
-                                 (long long) (xq_noplace - ba_noplace0), ba_ms / w,
+                                 (long long) ba_noplace, ba_ms / w,
                                  (long long) (peer.valid() ? peer.swaps() : 0));
-                    ba_noplace0 = xq_noplace;
-                    ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = 0;
+                    ba_swaps = ba_rounds = ba_swaps_l = ba_rounds_l = ba_noplace = 0;
                     ba_ms = 0;
                 }
                 if (bt_slotwin > 0)
