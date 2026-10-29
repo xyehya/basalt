@@ -43,7 +43,8 @@ prompt, up to 16384 new tokens and 4096 more, on a 16384-cell grid; a reply that
 16384 tokens between two decode windows, or goes back to the VRAM tail when the RAM is short. The next shallower
 request goes back to the VRAM tail too, and so does a streamed session when a request arrives with the RAM below the
 guard's floor (the pin is freed). A pin, and each larger one, is taken only when it leaves the RAM guard's floor free
-plus what serving can still take (its budget less the checkpoints and parked conversations held now) and the RAM copies
+plus what serving can still take (its budget less what it holds now: the checkpoints and the freed blocks kept for
+the next ones, the parked conversations, the checkpoint copy's page-locked buffer) and the RAM copies
 the prompt path's loan then needs; otherwise the request keeps its K/V in VRAM (`host K/V: kept in VRAM ...`). It is
 on by default with one GPU, the experts' RAM copy, a prompt path that lends cache slots and a KV other than `k8v4`; not
 with `--parallel`, a layer split, `--kv-resident` or `--vram-elastic`, where the K/V stays in VRAM.
@@ -192,7 +193,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
   states the RAM free and the largest safe value ('max').
 - While serving, the RAM guard watches MemAvailable against the margin plus 3.5 GiB (the margin alone when no expert
   is read from the SSD). Below it, the engine drops its parked conversations (except the one the next request
-  continues) and returns its free heap to the OS, and a request that arrives waits up to 30 s for the RAM to come back
+  continues), frees the checkpoint blocks it keeps for reuse and returns its free heap to the OS, and a request that arrives waits up to 30 s for the RAM to come back
   before it starts; one that adds at most 256 tokens to the live conversation (the server's wrap-up after a thinking
   budget) does not wait. A request cancelled during the wait ends there, before anything moves for it. A running
   request continues; it

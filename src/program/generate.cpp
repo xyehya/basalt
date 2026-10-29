@@ -739,8 +739,9 @@ ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basa
 struct ServeGrowth {
     uint64_t checkpoints = 0;     ///< the running checkpoints (the solo session's and the batch slots')
     uint64_t conversations = 0;   ///< the parked conversations
-    uint64_t other = 0;           ///< a request's buffers, the deferred copy's buffer, one image's buffers
-    uint64_t total() const { return checkpoints + conversations + other; }
+    uint64_t bounce = 0;          ///< the deferred checkpoint copy's page-locked buffer
+    uint64_t other = 0;           ///< a request's buffers, one image's buffers
+    uint64_t total() const { return checkpoints + conversations + bounce + other; }
 };
 
 ServeGrowth serve_growth(const Options& o, const basalt::core::ModelGeometry& g) {
@@ -753,7 +754,7 @@ ServeGrowth serve_growth(const Options& o, const basalt::core::ModelGeometry& g)
         const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
         s.checkpoints = (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
         s.conversations = (uint64_t) o.conversation_cache_mib << 20;
-        s.other += z.gdn;
+        s.bounce = z.gdn;
     }
     if (!o.vision_mmproj.empty()) {
         // the canvas (8-bit RGB), its normalized planar floats and the patches
@@ -6651,12 +6652,23 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // the part of what serving takes (serve_growth) the engine holds now, each counted up to its own share: the
+        // running checkpoints and the blocks their pool keeps for the next ones, the parked conversations, the deferred
+        // copy's page-locked buffer (taken above)
+        const ServeGrowth serve_budget = serve_growth(o, g);
+        auto serve_held = [&]() -> uint64_t {
+            uint64_t ck = basalt::core::CheckpointBytes::allocator_type::pooled_bytes();
+            for (const ConvCheckpoint& c : checks) ck += c.bytes();
+            return std::min<uint64_t>(ck, serve_budget.checkpoints) +
+                   std::min<uint64_t>(conversations.bytes(), serve_budget.conversations) +
+                   (ckd.pinned() ? serve_budget.bounce : 0);
+        };
         // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
         if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
             int64_t n_top = 0;
-            // what the engine still takes once serving (see serve_growth_bytes) and the file cache's floor while
-            // experts are read from the SSD (none when every expert has a tier)
-            const uint64_t later = serve_growth_bytes(o, g) +
+            // what the engine still takes once serving and the file cache's floor while experts are read from the SSD
+            // (none when every expert has a tier)
+            const uint64_t later = serve_budget.total() - std::min(serve_budget.total(), serve_held()) +
                                    (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
             const uint64_t add = src.top_up(stages.empty() ? profile : profile_all, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
@@ -6677,8 +6689,8 @@ int main(int argc, char** argv) {
         // what a stop's error compares against, to tell the engine's own growth from other programs'
         const uint64_t ready_avail = basalt::platform::available_memory();
         const uint64_t ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
-        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go and
-        // the heap's free pages return to the OS.  The checkpoints stay: a live request's rewind and the deferred
+        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go, the
+        // checkpoint blocks kept for reuse are freed and the heap's free pages return to the OS.  The checkpoints stay: a live request's rewind and the deferred
         // copy in flight use them.
         uint64_t shed_drop = 0;
         auto shed_if_low = [&]() {
@@ -6691,6 +6703,9 @@ int main(int argc, char** argv) {
             if (freed > 0)
                 basalt::log::info("basalt serve", "RAM guard: dropped %zu parked conversations (%zu MiB)", parked,
                                   freed >> 20);
+            if (const size_t pooled = basalt::core::CheckpointBytes::allocator_type::release_pooled(); pooled > 0)
+                basalt::log::info("basalt serve", "RAM guard: freed %zu MiB of checkpoint blocks kept for reuse",
+                                  pooled >> 20);
             const uint64_t before = basalt::platform::available_memory();
             basalt::platform::release_free_heap();
             const uint64_t after = basalt::platform::available_memory();
@@ -7171,6 +7186,14 @@ int main(int argc, char** argv) {
                 const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
                 const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
                 if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
+                // the tail without RAM copies: the experts it gives up that have no RAM copy take their RAM homes first
+                // (with the loan's), so the CPU tier reads them from RAM, not from the file
+                if (!kv_tail_copies) {
+                    std::string he;
+                    if (!home_given_up(xcache.slots_after_shrink(keep), he))
+                        basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the experts the tail gives up "
+                                             "without a copy (%s): they are read from the file", he.c_str());
+                }
                 if (!xcache.shrink(keep, e)) return false;
                 const int64_t live = xcache.slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
@@ -7223,15 +7246,9 @@ int main(int argc, char** argv) {
         const int64_t kv_host_cross = (int64_t) basalt::core::exp_flag("kv_host_cross", 99328);
         // a test's stand-in for the RAM free now, MiB (forces the fallback); negative: MemAvailable
         const int64_t kv_host_ram = (int64_t) basalt::core::exp_flag("kv_host_ram_mib", -1);
-        // a pin leaves the guard's floor free and what serving can still take: its budget less the part the session
-        // holds now (the running checkpoints, the parked conversations; each counted up to its own share)
-        const ServeGrowth kv_host_budget = serve_growth(o, g);
+        // a pin leaves the guard's floor free and what serving can still take: its budget less the part it holds now
         auto kv_host_kept = [&]() -> uint64_t {
-            uint64_t ck = 0;
-            for (const ConvCheckpoint& c : checks) ck += c.bytes();
-            const uint64_t held = std::min<uint64_t>(ck, kv_host_budget.checkpoints) +
-                                  std::min<uint64_t>(conversations.bytes(), kv_host_budget.conversations);
-            return basalt::program::kv_host_keep(guard_floor, kv_host_budget.total(), held);
+            return basalt::program::kv_host_keep(guard_floor, serve_budget.total(), serve_held());
         };
         if (kv_host_live)
             basalt::log::info("basalt serve", "host K/V: on, %lld-cell slot pool, streamed from %lld cells, %.2f GiB of RAM "
@@ -7437,16 +7454,18 @@ int main(int argc, char** argv) {
         // the next window reaching `need` cells, its first `live_c` cells written): a larger pool when the RAM above the
         // guard's floor takes it, else back to the VRAM tail.  1 done, 0 neither (`e`: the request stops there), -1 failed.
         auto kv_host_more = [&](int64_t p, int64_t need, int64_t left, int64_t live_c, std::string& e) -> int {
+            const int64_t had = kv_pool.cells();
+            // a pool of the whole context holds every cell a window writes (none goes past it), as the tail does there
+            if (had >= ss.max_cells) return 1;
             const auto t0 = Clock::now();
             if (!kv_drain(e)) return -1;
-            const int64_t had = kv_pool.cells();
             const int64_t cells = kv_host_pin_cells(need, left);
             const uint64_t bytes = basalt::core::KvHostPool::bytes_for(ss, g, cells);
             const uint64_t avail = kv_host_grow_ram >= 0 ? (uint64_t) kv_host_grow_ram << 20 : kv_ram_now();
             // the keep admission uses (it is never below the RAM homes' floor)
             const uint64_t floor = std::max<uint64_t>(guard_floor + (256ull << 20), kv_host_kept());
             auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
-            std::string pe = cells <= had ? "the context is full" : "no RAM";
+            std::string pe = "no RAM";
             if (cells > had && avail > floor && bytes <= avail - floor) {
                 const int r = kv_host_regrow(cells, live_c, pe, e);
                 if (r < 0) return -1;
@@ -7457,7 +7476,6 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            if (cells <= had) { e = "host K/V: the request's " + std::to_string(had) + " pinned cells are used up"; return 0; }
             const std::string why = pe;
             const int r = kv_host_to_vram(p, live_c, pe, e);
             if (r < 0) return -1;
