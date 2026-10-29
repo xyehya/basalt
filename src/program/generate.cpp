@@ -10525,6 +10525,7 @@ int main(int argc, char** argv) {
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
+                if (forced) T = (int) std::min<int64_t>(T, ppl->end() - p);   // a lookup window ends at the base's last token too
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
