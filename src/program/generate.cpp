@@ -6652,12 +6652,23 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // the part of what serving takes (serve_growth) the engine holds now, each counted up to its own share: the
+        // running checkpoints and the blocks their pool keeps for the next ones, the parked conversations, the deferred
+        // copy's page-locked buffer (taken above)
+        const ServeGrowth serve_budget = serve_growth(o, g);
+        auto serve_held = [&]() -> uint64_t {
+            uint64_t ck = basalt::core::CheckpointBytes::allocator_type::pooled_bytes();
+            for (const ConvCheckpoint& c : checks) ck += c.bytes();
+            return std::min<uint64_t>(ck, serve_budget.checkpoints) +
+                   std::min<uint64_t>(conversations.bytes(), serve_budget.conversations) +
+                   (ckd.pinned() ? serve_budget.bounce : 0);
+        };
         // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
         if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
             int64_t n_top = 0;
-            // what the engine still takes once serving (see serve_growth_bytes) and the file cache's floor while
-            // experts are read from the SSD (none when every expert has a tier)
-            const uint64_t later = serve_growth_bytes(o, g) +
+            // what the engine still takes once serving and the file cache's floor while experts are read from the SSD
+            // (none when every expert has a tier)
+            const uint64_t later = serve_budget.total() - std::min(serve_budget.total(), serve_held()) +
                                    (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
             const uint64_t add = src.top_up(stages.empty() ? profile : profile_all, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
@@ -7224,17 +7235,9 @@ int main(int argc, char** argv) {
         const int64_t kv_host_cross = (int64_t) basalt::core::exp_flag("kv_host_cross", 99328);
         // a test's stand-in for the RAM free now, MiB (forces the fallback); negative: MemAvailable
         const int64_t kv_host_ram = (int64_t) basalt::core::exp_flag("kv_host_ram_mib", -1);
-        // a pin leaves the guard's floor free and what serving can still take: its budget less the part the session
-        // holds now (the running checkpoints and the blocks their pool keeps for the next ones, the parked
-        // conversations, the deferred copy's page-locked buffer taken at the start; each counted up to its own share)
-        const ServeGrowth kv_host_budget = serve_growth(o, g);
+        // a pin leaves the guard's floor free and what serving can still take: its budget less the part it holds now
         auto kv_host_kept = [&]() -> uint64_t {
-            uint64_t ck = basalt::core::CheckpointBytes::allocator_type::pooled_bytes();
-            for (const ConvCheckpoint& c : checks) ck += c.bytes();
-            const uint64_t held = std::min<uint64_t>(ck, kv_host_budget.checkpoints) +
-                                  std::min<uint64_t>(conversations.bytes(), kv_host_budget.conversations) +
-                                  (ckd.pinned() ? kv_host_budget.bounce : 0);
-            return basalt::program::kv_host_keep(guard_floor, kv_host_budget.total(), held);
+            return basalt::program::kv_host_keep(guard_floor, serve_budget.total(), serve_held());
         };
         if (kv_host_live)
             basalt::log::info("basalt serve", "host K/V: on, %lld-cell slot pool, streamed from %lld cells, %.2f GiB of RAM "
