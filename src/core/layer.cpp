@@ -827,10 +827,12 @@ bool qsa_state_set_mode(QsaState& st, const ModelGeometry& g, int mode, const ba
         basalt::kernels::kv_ring_table(st.page_table, st.n_pages, st.n_pages, stream);   // the identity
         host_map_free(st, stream);
     }
+    // the launches above stop the engine on their own errors, so one here is the device's: the state is switched
+    // already and the context is lost, and the engine stops as they do
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
-        err = std::string("KV mode switch: ") + cudaGetErrorString(e);
-        return false;
+        basalt::log::error("basalt", "KV mode switch: %s", cudaGetErrorString(e));
+        std::exit(1);
     }
     return true;
 }

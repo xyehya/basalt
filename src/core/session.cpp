@@ -12,6 +12,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/ngram.hpp"
 #include "basalt/platform/compiler.hpp"
+#include "basalt/log.hpp"
 
 #include <cuda_runtime.h>
 
@@ -233,13 +234,13 @@ bool session_kv_set_mode(SessionState& s, const ModelGeometry& g, int mode, cons
             (void) qsa_state_set_mode(s.qsa_states[s.qsa_ord0 + j], g, was[(size_t) j].mode, was[(size_t) j].host,
                                       was[(size_t) j].host_cells, live_cells, stream, ignored);
     }
+    // a failed wait is an execution error: the context is lost, whatever the layers point at now
     const cudaError_t e = cudaStreamSynchronize((cudaStream_t) stream);
-    if (done < s.qsa_alloc) return false;
     if (e != cudaSuccess) {
-        err = std::string("KV mode switch: ") + cudaGetErrorString(e);
-        return false;
+        basalt::log::error("basalt", "KV mode switch: %s", cudaGetErrorString(e));
+        std::exit(1);
     }
-    return true;
+    return done == s.qsa_alloc;
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
