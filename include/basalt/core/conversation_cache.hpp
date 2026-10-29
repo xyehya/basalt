@@ -67,6 +67,18 @@ struct PooledAlloc {
         for (const auto& b : p.blocks) n += b.second;
         return n;
     }
+    /// Frees the blocks the pool keeps; returns their bytes.
+    static size_t release_pooled() {
+        Pool& p = pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        size_t n = 0;
+        for (const auto& b : p.blocks) {
+            n += b.second;
+            ::operator delete(b.first);
+        }
+        p.blocks.clear();
+        return n;
+    }
     template <class U>
     bool operator==(const PooledAlloc<U>&) const noexcept { return true; }
     template <class U>
