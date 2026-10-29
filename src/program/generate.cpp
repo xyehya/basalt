@@ -739,8 +739,9 @@ ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basa
 struct ServeGrowth {
     uint64_t checkpoints = 0;     ///< the running checkpoints (the solo session's and the batch slots')
     uint64_t conversations = 0;   ///< the parked conversations
-    uint64_t other = 0;           ///< a request's buffers, the deferred copy's buffer, one image's buffers
-    uint64_t total() const { return checkpoints + conversations + other; }
+    uint64_t bounce = 0;          ///< the deferred checkpoint copy's page-locked buffer
+    uint64_t other = 0;           ///< a request's buffers, one image's buffers
+    uint64_t total() const { return checkpoints + conversations + bounce + other; }
 };
 
 ServeGrowth serve_growth(const Options& o, const basalt::core::ModelGeometry& g) {
@@ -753,7 +754,7 @@ ServeGrowth serve_growth(const Options& o, const basalt::core::ModelGeometry& g)
         const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
         s.checkpoints = (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
         s.conversations = (uint64_t) o.conversation_cache_mib << 20;
-        s.other += z.gdn;
+        s.bounce = z.gdn;
     }
     if (!o.vision_mmproj.empty()) {
         // the canvas (8-bit RGB), its normalized planar floats and the patches
@@ -7224,13 +7225,15 @@ int main(int argc, char** argv) {
         // a test's stand-in for the RAM free now, MiB (forces the fallback); negative: MemAvailable
         const int64_t kv_host_ram = (int64_t) basalt::core::exp_flag("kv_host_ram_mib", -1);
         // a pin leaves the guard's floor free and what serving can still take: its budget less the part the session
-        // holds now (the running checkpoints, the parked conversations; each counted up to its own share)
+        // holds now (the running checkpoints and the blocks their pool keeps for the next ones, the parked
+        // conversations, the deferred copy's page-locked buffer taken at the start; each counted up to its own share)
         const ServeGrowth kv_host_budget = serve_growth(o, g);
         auto kv_host_kept = [&]() -> uint64_t {
-            uint64_t ck = 0;
+            uint64_t ck = basalt::core::CheckpointBytes::allocator_type::pooled_bytes();
             for (const ConvCheckpoint& c : checks) ck += c.bytes();
             const uint64_t held = std::min<uint64_t>(ck, kv_host_budget.checkpoints) +
-                                  std::min<uint64_t>(conversations.bytes(), kv_host_budget.conversations);
+                                  std::min<uint64_t>(conversations.bytes(), kv_host_budget.conversations) +
+                                  (ckd.pinned() ? kv_host_budget.bounce : 0);
             return basalt::program::kv_host_keep(guard_floor, kv_host_budget.total(), held);
         };
         if (kv_host_live)
