@@ -37,7 +37,8 @@ There are two kinds of setting:
   speculation. The server passes them on. Put them on the command line like any other flag (`--kv int8`). The server passes
   them to the engine as typed, in order, and does not interpret their values, so a flag that takes several values
   works too (`--control-vector-layer-range 4 44`). It asks the engine binary which flags it accepts, and stops at
-  startup on a flag name it does not know.
+  startup on a flag name it does not know. It adds `--serve` itself, and `--vision` (with `--vision-mmproj` for
+  `vision dynamic`) when `vision` is on.
 
 A config file is one JSON object with two optional blocks:
 
@@ -148,10 +149,14 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`. |
 | `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. `tools/convert/convert.py --profile` reads it. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
+| `resident-cpu-experts` | engine | switch | off (implied by `resident-experts`) | With `mmap-experts` and a pack with an expert profile: keep the experts the GPU does not hold in ordinary RAM, so none is read from the file again. `resident-experts` is this with the copy page-locked when possible and the file mapping as a fallback when it does not fit. |
 | `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. Works with `resident-experts`: a shrink first copies the experts it gives back into RAM, so none is read from the file, and is refused (nothing changed) when the RAM above the floor cannot hold them; a grow frees those copies. |
+| `vram-segment-mib` | engine | integer MiB, at least 64 | 512 | The segment size of `vram-elastic`'s expert cache: the step VRAM is lent and taken back in. Below 64 turns `vram-elastic` off with a warning. |
 | `expert-cache` | engine | `auto`, or an integer count of expert blobs | `auto` (on packs with an expert profile) | Keep this many expert blobs in VRAM and compute their rows on the GPU. `auto` takes as many as fit in the VRAM left after the weights, the session and `vram-reserve-mib`. |
 | `adapt-swaps` | engine | integer | 96 (`0` = off) | Most experts one adaptive round swaps into the main GPU. `0` turns the swaps off. |
 | `peer-adapt-swaps` | engine | integer | the value of `adapt-swaps` | Peer card cache swaps per adaptation step. Only with a peer card. |
+| `adapt-every` | engine | integer decode windows | 1 for a server on one GPU, else 4 | Run an adaptive round every N decode windows (below). `0` keeps the experts in VRAM as loaded. |
+| `adapt-decay` | engine | number | 0.85 on one GPU (with or without a peer card), 0.7 with the layers split over several GPUs | What the routing counts are multiplied by after each round. Lower forgets older routing sooner. |
 
 ### The adaptive tier
 
@@ -161,8 +166,8 @@ without a peer tier the round ranks every layer together, so a layer that routes
 layers that route to fewer. The peer card
 takes the next most-used experts the main card does not hold. After each round every count is decayed, so recent routing
 outweighs old. Copies run on a side stream and land a few windows later. Adaptation moves experts between the CPU and
-the GPUs, so output is not bit-identical from run to run; see [precision](../precision/index.md). The round settings are
-engine diagnostic flags; with adaptation off the tiers stay as loaded and `expert-profile-save` has nothing to learn.
+the GPUs, so output is not bit-identical from run to run; see [precision](../precision/index.md). With adaptation off
+(`adapt-every 0`) the tiers stay as loaded and `expert-profile-save` has nothing to learn.
 
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
 [running](../running.md#memory-floors).
@@ -176,6 +181,7 @@ The prompt is read in batched chunks. These settings set the chunk size and how 
 | `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a chunk size in tokens | `auto` | Read the prompt in chunks of this many tokens. `auto` takes the largest chunk the expert cache can lend, up to a ceiling; `auto:N` sets that ceiling. |
 | `prefill-cpu-share` | engine | number from 0 to 1 | 0.6 | Share of the streamed prompt experts the CPU computes; `0` has the GPU stream them all. Fixed, so the output is the same from run to run. A weaker CPU may prefer a lower value. |
 | `prefill-fp8` | engine | switch | off | Experimental. Run most of the prompt's dense projections in FP8 (E4M3) in chunks of 1,024 tokens or more: long prompts read about 15% faster, and the numerics change, so the output after a prompt drifts further from the reference ([precision](../precision/index.md#prefill)). |
+| `short-read` | engine | integer tokens | 64 (`0` = off) | A fresh text part of the prompt of at most N tokens (a chat message, a short tool result) is read through the decode windows instead of the batched prompt path. |
 | `peer-prefill-rows` | engine | integer rows per layer | half of chunk x top-k | Prompt rows per layer the peer card computes. `0` keeps the prompt path on the main card. |
 
 ## Speculative decoding (MTP)
@@ -186,6 +192,9 @@ plain decoding would give.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `spec` | engine | integer | 8 with a drafter, else 0 | Verify windows of at most N tokens: the last accepted token plus up to N-1 drafts. `0` or `1` turns speculation off. |
+| `suffix-draft` | engine | integer tokens | 3 (`0` = drafter only) | Prompt lookup: when the text being written repeats an earlier stretch of the context by at least N tokens, a window may take what followed it there instead of the drafter's guesses, where that is expected to pay. A lookup window may be up to 2 tokens longer than `spec`, at most 8. |
+| `mtp-max-t` | engine | integer tokens | 0 (= `spec`) | Cap the drafter's own windows at N tokens; longer windows then come only from prompt lookup. |
+| `mtp-window` | engine | integer cells | 32768 (`0` = every cell) | The drafter attends to the last N cells of the context. |
 | `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
 
 ## Parallel slots
@@ -203,6 +212,8 @@ plain decoding would give.
 | `prompt-cache` | engine | integer | 6 | Conversation checkpoints kept between requests, about 118 MB of RAM each. A single-GPU server also keeps one page-locked buffer of that size to copy a new checkpoint through; when RAM is short it copies through pageable memory instead, a little slower. `0` reads every prompt from the start. More checkpoints let more chats resume without re-reading. |
 | `prompt-cache-every` | engine | integer tokens | 16384 (`0` = off) | Also checkpoint every N freshly read prompt tokens. |
 | `prompt-cache-root` | engine | integer tokens | 2048 (`0` = never) | Checkpoint a prompt's first turn boundary (the end of the system prompt) when it is at least this long. |
+| `turn-token` | engine | token id | 248045 (`<\|im_start\|>`) | The token that opens a chat turn; the last one in a prompt is where the conversation checkpoint goes. |
+| `tail-role-token` | engine | token id | -1 (off) | When the turn right before the last one opens with this role token (a short trailing turn such as a reasoning-effort note), the checkpoint goes in front of that turn, so it holds the conversation and not the note. |
 | `conversation-cache-mib` | engine | integer MiB | 0 (off) | RAM budget for parked conversations, so separate chats can come back without re-reading. |
 | `conversation-cache-slots` | engine | integer | 4 | At most this many parked conversations. |
 | `conversation-cache-min-free-mib` | engine | integer MiB | 2560 | Physical RAM floor kept free when parking a conversation. |
@@ -212,8 +223,6 @@ plain decoding would give.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. One image is capped at 64 megapixels before it is decoded. |
-
-Diagnostic flags: `bin/basalt --help`
 
 ## Control vectors
 
