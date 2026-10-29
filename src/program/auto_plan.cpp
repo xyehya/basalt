@@ -133,6 +133,14 @@ bool kv_host_pool_serves(int64_t pool_cells, int64_t at, int64_t window) {
     return pool_cells > 0 && pool_cells >= std::max<int64_t>(at, 0) + std::max<int64_t>(window, 0);
 }
 
+bool cut_gives_up_bare(const std::vector<int32_t>& res, int64_t cut, int64_t n_expert,
+                       const std::function<bool(int64_t, int64_t)>& has_copy) {
+    if (n_expert <= 0) return false;
+    for (size_t i = 0; i < res.size(); ++i)
+        if (res[i] >= 0 && res[i] >= cut && !has_copy((int64_t) i / n_expert, (int64_t) i % n_expert)) return true;
+    return false;
+}
+
 const char* kv_host_act_name(KvHostAct a) {
     switch (a) {
         case KvHostAct::take: return "take";
