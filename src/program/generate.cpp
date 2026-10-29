@@ -7454,16 +7454,18 @@ int main(int argc, char** argv) {
         // the next window reaching `need` cells, its first `live_c` cells written): a larger pool when the RAM above the
         // guard's floor takes it, else back to the VRAM tail.  1 done, 0 neither (`e`: the request stops there), -1 failed.
         auto kv_host_more = [&](int64_t p, int64_t need, int64_t left, int64_t live_c, std::string& e) -> int {
+            const int64_t had = kv_pool.cells();
+            // a pool of the whole context holds every cell a window writes (none goes past it), as the tail does there
+            if (had >= ss.max_cells) return 1;
             const auto t0 = Clock::now();
             if (!kv_drain(e)) return -1;
-            const int64_t had = kv_pool.cells();
             const int64_t cells = kv_host_pin_cells(need, left);
             const uint64_t bytes = basalt::core::KvHostPool::bytes_for(ss, g, cells);
             const uint64_t avail = kv_host_grow_ram >= 0 ? (uint64_t) kv_host_grow_ram << 20 : kv_ram_now();
             // the keep admission uses (it is never below the RAM homes' floor)
             const uint64_t floor = std::max<uint64_t>(guard_floor + (256ull << 20), kv_host_kept());
             auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
-            std::string pe = cells <= had ? "the context is full" : "no RAM";
+            std::string pe = "no RAM";
             if (cells > had && avail > floor && bytes <= avail - floor) {
                 const int r = kv_host_regrow(cells, live_c, pe, e);
                 if (r < 0) return -1;
@@ -7474,7 +7476,6 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            if (cells <= had) { e = "host K/V: the request's " + std::to_string(had) + " pinned cells are used up"; return 0; }
             const std::string why = pe;
             const int r = kv_host_to_vram(p, live_c, pe, e);
             if (r < 0) return -1;
