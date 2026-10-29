@@ -4958,7 +4958,6 @@ int main(int argc, char** argv) {
         tier_file_bytes = b_file;
         const double total = (double) (b_vram + b_peer + b_ram + b_top + b_file);
         if (total <= 0.0) return;
-        basalt::core::draft_cum_cpu_mb() = (float) ((double) (b_ram + b_top) / (double) (g.n_layers * g.n_expert) / 1e6);
         constexpr double kGiB = 1073741824.0;
         auto pct = [&](uint64_t b) { return 100.0 * (double) b / total; };
         // RAM is the loaded copy (the bytes the loader reports); the top-up added after the load is shown beside it
@@ -7516,12 +7515,10 @@ int main(int argc, char** argv) {
             // scanned, the first refused one is resampled under the mask, and the segment ends there
             std::unique_ptr<basalt::program::grammar::Guard> guard;
             // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
-            // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
-            // history and last proposal
+            // their probabilities for the slot's next window, its prompt-lookup history and last proposal
             int32_t dr[16] = {};
             float dprob[16] = {};
             int n_dr = 0;
-            basalt::core::DraftCumAdapt cum;
             std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
             int32_t sbuf[16] = {};
             int sk = 0, smatch = 0;
@@ -7536,6 +7533,7 @@ int main(int argc, char** argv) {
         const bool batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
         const int S_all = S;
         basalt::spec::DraftPolicy bpolicy(S);   // the lookup-or-MTP choice, costs per row
+        const float cum_th = basalt::core::draft_cum_th();   // the draft-length rule's threshold
         double bt_draft = 0, bt_draft_last = 0;
         int64_t bt_slotwin = 0, bt_dr_off = 0, bt_dr_acc = 0;
         std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript((size_t) std::max(o.batch, 0));
@@ -7973,7 +7971,7 @@ int main(int argc, char** argv) {
                 for (int sg = 0; sg < S; ++sg) {
                     BSlot& sl = bs[(size_t) rows[sg]];
                     int T = 1;
-                    while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, sl.cum.th())) ++T;
+                    while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, cum_th)) ++T;
                     sl.from_sfx = false;
                     sl.sk = 0;
                     if (sl.sfx && sl.n_dr > 0) {
@@ -8173,9 +8171,8 @@ int main(int argc, char** argv) {
                 }
                 std::printf("\n");
                 sl.produced += k;
-                if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
+                if (real) {   // the window's verdict on its drafts: the lookup history, the policy
                     const int a = k - 1, Tw = lens[sg];
-                    if (Tw > 1 && !sl.from_sfx) sl.cum.observe(sl.dprob, Tw - 1, a);
                     if (Tw > 1) sl.acc = 0.8 * sl.acc + 0.2 * ((double) a / (double) (Tw - 1));
                     sl.drafts_offered += Tw - 1;
                     sl.drafts_accepted += a;
@@ -8234,7 +8231,7 @@ int main(int argc, char** argv) {
                     mtp.set_ple_session(bslot_ss[0][(size_t) b].get());
                     sl.n_dr = 0;
                     if (ci < nfull) {
-                        mtp.set_cum_th(sl.cum.th());
+                        mtp.set_cum_th(cum_th);
                         int nd = 0;
                         if (!mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err, sl.dprob,
                                            &nd)) {
@@ -8576,8 +8573,10 @@ int main(int argc, char** argv) {
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed; ppl_score=0
-            // forces the same tokens through the same windows without scoring or writing rows (a timing mode)
-            int req_ppl = -1, req_ppl_t = 3, req_ppl_score = 1;
+            // forces the same tokens through the same windows without scoring or writing rows (a timing mode);
+            // ppl_force=1 drafts and sizes the windows as decoding does and judges the drafts against the chunk's
+            // tokens, so every drafting rule writes the same text (a timing mode for drafting, rows not scored)
+            int req_ppl = -1, req_ppl_t = 3, req_ppl_score = 1, req_ppl_force = 0;
             int req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
             if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
                                      // embedding file path is the first token without an =
@@ -8609,6 +8608,7 @@ int main(int argc, char** argv) {
                     else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_score") req_ppl_score = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "ppl_force") req_ppl_force = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -10442,7 +10442,7 @@ int main(int argc, char** argv) {
             }
             std::vector<int32_t> drafts((size_t) std::max(S, basalt::core::kMtpChainMax), 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob((size_t) std::max(S, basalt::core::kMtpChainMax), 0.0f);
-            basalt::core::DraftCumAdapt cum_adapt;   // this request's draft threshold
+            const float cum_th = basalt::core::draft_cum_th();   // the draft-length rule's threshold
             std::vector<int32_t> sbuf((size_t) S, 0);
             if (o.suffix_draft > 0) {
                 sfx.reset();
@@ -10520,18 +10520,19 @@ int main(int argc, char** argv) {
                 int T = 1;
                 if (held.on) T = held.T;
                 else
-                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_th)) ++T;
                 if (first_window) T = (int) (n - fold_p0);
                 const int e0 = first_window ? T - 1 : 0;   // rows before it are prompt tokens: forced, not emitted
+                const bool forced = ppl != nullptr && req_ppl_force != 0;
                 if (ppl != nullptr) {
                     if (p >= ppl->end()) break;
-                    T = (int) std::min<int64_t>(req_ppl_t, ppl->end() - p);
+                    T = (int) std::min<int64_t>(forced ? T : req_ppl_t, ppl->end() - p);
                 }
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window && ppl == nullptr && !held.on) {
+                if (o.suffix_draft > 0 && !first_window && (ppl == nullptr || forced) && !held.on) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
@@ -10539,6 +10540,7 @@ int main(int argc, char** argv) {
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
+                if (forced) T = (int) std::min<int64_t>(T, ppl->end() - p);   // a lookup window ends at the base's last token too
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
@@ -10548,7 +10550,7 @@ int main(int argc, char** argv) {
                     for (int i = 0; i < T; ++i) window[(size_t) i] = held.win[(size_t) i];
                 if (e0 > 0)
                     for (int i = 1; i < T; ++i) window[(size_t) i] = (int32_t) ids[(size_t) (p + i)];
-                if (ppl != nullptr)
+                if (ppl != nullptr && !forced)
                     for (int i = 0; i < T; ++i) window[(size_t) i] = ppl->token(p + i);
                 // the guess: this window is accepted whole and the target's next token is the chain's draft T - 1; the next
                 // window then holds that draft and the ones the chain made after it
@@ -10559,7 +10561,7 @@ int main(int argc, char** argv) {
                     n_chain = mtp.draft_more(n_chain, drafts.data(), dprob.data());   // made beside this window's stage 0
                     if (n_chain <= T || !basalt::core::draft_keep(dprob.data(), T - 1, kPairTheta)) return 0;
                     int tb = 1;
-                    while (tb < S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, cum_adapt.th()))
+                    while (tb < S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, cum_th))
                         ++tb;
                     if (tb < 2) return 0;
                     wb[0] = drafts[(size_t) T - 1];
@@ -10645,6 +10647,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                if (forced)   // the chunk's tokens stand in for the target's picks
+                    for (int t = 0; t < T; ++t) outv[(size_t) t] = ppl->token(p + t + 1);
                 int a = 0;
                 if (e0 > 0) {
                     for (int i = 0; i < e0; ++i) outv[(size_t) i] = window[(size_t) i + 1];
@@ -10690,7 +10694,7 @@ int main(int argc, char** argv) {
                         ++grammar_resamples;
                     }
                 }
-                if (ppl != nullptr) {   // every row scored (unless ppl_score=0) and committed
+                if (ppl != nullptr && !forced) {   // every row scored (unless ppl_score=0) and committed
                     a = T - 1;
                     for (int t = 0; t < T; ++t) {
                         if (req_ppl_score != 0) {
@@ -10860,8 +10864,7 @@ int main(int argc, char** argv) {
                     ++rounds;
                     const Clock::time_point tw2 = Clock::now();
                     basalt::core::decode_gaps().mark(5);
-                    if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
-                    mtp.set_cum_th(cum_adapt.th());
+                    mtp.set_cum_th(cum_th);
                     bool drafted = true;
                     if (hold) {
                         // the tokens go out; the next window's last stage runs behind this window's commit while its first
@@ -10892,8 +10895,8 @@ int main(int argc, char** argv) {
                     } else if (will_draft && mtp_on) {
                         mtp.set_launch_hook(after_launch);
                         pair_hint = pair_req && full_ema >= kPairFull;
-                        mtp.set_cum_th(pair_hint ? cum_adapt.th() * kPairChainScale : cum_adapt.th());
-                        mtp.set_host_th(cum_adapt.th());
+                        mtp.set_cum_th(pair_hint ? cum_th * kPairChainScale : cum_th);
+                        mtp.set_host_th(cum_th);
                         drafted = mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), err, dprob.data(), &n_chain);
                         mtp.set_launch_hook(nullptr);
                         if (drafted && pipe_on) {   // the next window's first stage starts after the chain's kernels
@@ -10973,8 +10976,7 @@ int main(int argc, char** argv) {
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
                 basalt::core::decode_gaps().mark(5);
-                if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
-                mtp.set_cum_th(cum_adapt.th());
+                mtp.set_cum_th(cum_th);
                 const bool drafted = eos || produced_n >= max_new || !mtp_on ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
                 {
@@ -11539,7 +11541,7 @@ int main(int argc, char** argv) {
         int32_t x = (int32_t) tok;
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
-        basalt::core::DraftCumAdapt cum_adapt;
+        const float cum_th = basalt::core::draft_cum_th();
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
         // the first window is the last prompt token alone (it produces the first generated token and the MTP's
         // first cell)
@@ -11568,7 +11570,7 @@ int main(int argc, char** argv) {
             int T = S_mtp;
             if (use_mtp) {
                 T = 1;
-                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_th)) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;
@@ -11642,8 +11644,7 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            if (use_mtp && !from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
-            if (use_mtp) mtp.set_cum_th(cum_adapt.th());
+            if (use_mtp) mtp.set_cum_th(cum_th);
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
             if (adapt_thr.joinable()) adapt_thr.join();
