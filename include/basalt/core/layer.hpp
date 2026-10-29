@@ -312,7 +312,8 @@ void qsa_state_kv_cap(QsaState& st, bool capped);
 /// residency map; 1 -> 0 needs the arrays uncapped and backed to `live_cells`, copies them from the host copy and
 /// writes the identity table.  1 -> 1 points the state at another host copy (the cells already in it) and empties
 /// the map.  The pool addresses do not change; graphs captured in the other mode do not fit (kv_stream_resolve).
-/// Queued on `stream`; false with `err` (nothing changed) when the state or the extents do not allow it.
+/// Queued on `stream`; false with `err` (nothing changed) when the state or the extents do not allow it; a device error
+/// after the state changed stops the engine.
 bool qsa_state_set_mode(QsaState& st, const ModelGeometry& g, int mode, const basalt::kernels::KvHostPools& host,
                         int64_t host_cells, int64_t live_cells, void* stream, std::string& err);
 bool qsa_kv_int8();

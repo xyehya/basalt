@@ -501,6 +501,9 @@ void usage() {
                  "  --prefill-cpu-share F  share of the streamed prompt experts the CPU computes, 0 to 1 (default\n"
                  "                       0.6; 0 = the GPU streams them all).  Fixed, so the output is the same\n"
                  "                       from run to run; a weaker CPU may prefer a lower value\n"
+                 "  --prefill-fp8        experimental: most of the prompt's dense projections in FP8 (E4M3) from\n"
+                 "                       chunks of 1024 tokens: long prompts read faster, the numerics change\n"
+                 "                       (docs/precision)\n"
                  "  --adapt-swaps N      most experts a round swaps into the main GPU (default 96; 0 = off)\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
@@ -739,8 +742,9 @@ ConvStateSizes conv_state_sizes(const basalt::core::ModelGeometry& g, const basa
 struct ServeGrowth {
     uint64_t checkpoints = 0;     ///< the running checkpoints (the solo session's and the batch slots')
     uint64_t conversations = 0;   ///< the parked conversations
-    uint64_t other = 0;           ///< a request's buffers, the deferred copy's buffer, one image's buffers
-    uint64_t total() const { return checkpoints + conversations + other; }
+    uint64_t bounce = 0;          ///< the deferred checkpoint copy's page-locked buffer
+    uint64_t other = 0;           ///< a request's buffers, one image's buffers
+    uint64_t total() const { return checkpoints + conversations + bounce + other; }
 };
 
 ServeGrowth serve_growth(const Options& o, const basalt::core::ModelGeometry& g) {
@@ -753,7 +757,7 @@ ServeGrowth serve_growth(const Options& o, const basalt::core::ModelGeometry& g)
         const uint64_t one = z.gdn + z.ple + (uint64_t) g.n_qsa_layers() * (z.tail + z.dead + z.block_pos);
         s.checkpoints = (uint64_t) (o.prompt_cache + 1) * (uint64_t) std::max(o.batch, 1) * one;
         s.conversations = (uint64_t) o.conversation_cache_mib << 20;
-        s.other += z.gdn;
+        s.bounce = z.gdn;
     }
     if (!o.vision_mmproj.empty()) {
         // the canvas (8-bit RGB), its normalized planar floats and the patches
@@ -1097,6 +1101,7 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(next("--adapt-decay")); o.adapt_decay_set = true; }
         else if (a == "--prefill-cpu-share") o.prefill_cpu_share = std::atof(next("--prefill-cpu-share"));
+        else if (a == "--prefill-fp8") o.prefill_fp8 = true;
         else if (a == "--relaxed-drafting") {   // the value is optional: a number in (0, 1] when one follows
             o.relaxed_drafting = kRelaxedDraftingDefault;
             if (i + 1 < argc) {
@@ -1630,6 +1635,7 @@ int main(int argc, char** argv) {
         basalt::log::error("basalt generate", "invalid sampling or resource parameter");
         return 2;
     }
+    basalt::prefill::Prefill::set_fp8(o.prefill_fp8);
     if (!(o.prefill_cpu_share >= 0.0 && o.prefill_cpu_share <= 1.0)) {
         basalt::log::error("basalt generate", "--prefill-cpu-share must be a number from 0 to 1");
         return 2;
@@ -3058,6 +3064,9 @@ int main(int argc, char** argv) {
             constexpr int64_t kSlotWindowsMib = 24;   // one session's solo windows, or the batch windows
             if (o.serve || ml == nullptr || std::strcmp(ml, "EAGER") != 0) late_b += kLazyKernelsMib << 20;
             if (o.serve && o.batch >= 2 && slot0_is_solo) late_b += ((int64_t) o.batch * kSlotWindowsMib) << 20;
+            // --prefill-fp8: cuBLASLt's handle and its E4M3 kernels load on the prompt path's first FP8 product
+            constexpr int64_t kFp8KernelsMib = 8;
+            if (o.prefill_fp8) late_b += kFp8KernelsMib << 20;
         }
         // the GDN mixer split by key head loads CUDA0's share of the GDN layers after the cache is sized
         if (o.peer_device >= 1) {
@@ -4957,7 +4966,6 @@ int main(int argc, char** argv) {
         tier_file_bytes = b_file;
         const double total = (double) (b_vram + b_peer + b_ram + b_top + b_file);
         if (total <= 0.0) return;
-        basalt::core::draft_cum_cpu_mb() = (float) ((double) (b_ram + b_top) / (double) (g.n_layers * g.n_expert) / 1e6);
         constexpr double kGiB = 1073741824.0;
         auto pct = [&](uint64_t b) { return 100.0 * (double) b / total; };
         // RAM is the loaded copy (the bytes the loader reports); the top-up added after the load is shown beside it
@@ -6651,12 +6659,23 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // the part of what serving takes (serve_growth) the engine holds now, each counted up to its own share: the
+        // running checkpoints and the blocks their pool keeps for the next ones, the parked conversations, the deferred
+        // copy's page-locked buffer (taken above)
+        const ServeGrowth serve_budget = serve_growth(o, g);
+        auto serve_held = [&]() -> uint64_t {
+            uint64_t ck = basalt::core::CheckpointBytes::allocator_type::pooled_bytes();
+            for (const ConvCheckpoint& c : checks) ck += c.bytes();
+            return std::min<uint64_t>(ck, serve_budget.checkpoints) +
+                   std::min<uint64_t>(conversations.bytes(), serve_budget.conversations) +
+                   (ckd.pinned() ? serve_budget.bounce : 0);
+        };
         // the load's own buffers are gone: RAM still free keeps the next-hottest experts the first sizing left out
         if (srcp == &src && src.complement_ready() && o.resident_budget == 0) {
             int64_t n_top = 0;
-            // what the engine still takes once serving (see serve_growth_bytes) and the file cache's floor while
-            // experts are read from the SSD (none when every expert has a tier)
-            const uint64_t later = serve_growth_bytes(o, g) +
+            // what the engine still takes once serving and the file cache's floor while experts are read from the SSD
+            // (none when every expert has a tier)
+            const uint64_t later = serve_budget.total() - std::min(serve_budget.total(), serve_held()) +
                                    (ram_floor_bytes - std::min(ram_floor_bytes, basalt::platform::ram_margin()));
             const uint64_t add = src.top_up(stages.empty() ? profile : profile_all, [&](int32_t l, int32_t e) {
                 return host_res[(size_t) l * g.n_expert + (size_t) e] >= 0 || (peer.valid() && peer.has(l, e));
@@ -6677,8 +6696,8 @@ int main(int argc, char** argv) {
         // what a stop's error compares against, to tell the engine's own growth from other programs'
         const uint64_t ready_avail = basalt::platform::available_memory();
         const uint64_t ready_rss = (uint64_t) basalt::platform::process_memory().rss_mib << 20;
-        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go and
-        // the heap's free pages return to the OS.  The checkpoints stay: a live request's rewind and the deferred
+        // once per drop below the guard's floor, on the serve thread between steps: the parked conversations go, the
+        // checkpoint blocks kept for reuse are freed and the heap's free pages return to the OS.  The checkpoints stay: a live request's rewind and the deferred
         // copy in flight use them.
         uint64_t shed_drop = 0;
         auto shed_if_low = [&]() {
@@ -6691,6 +6710,9 @@ int main(int argc, char** argv) {
             if (freed > 0)
                 basalt::log::info("basalt serve", "RAM guard: dropped %zu parked conversations (%zu MiB)", parked,
                                   freed >> 20);
+            if (const size_t pooled = basalt::core::CheckpointBytes::allocator_type::release_pooled(); pooled > 0)
+                basalt::log::info("basalt serve", "RAM guard: freed %zu MiB of checkpoint blocks kept for reuse",
+                                  pooled >> 20);
             const uint64_t before = basalt::platform::available_memory();
             basalt::platform::release_free_heap();
             const uint64_t after = basalt::platform::available_memory();
@@ -7171,6 +7193,17 @@ int main(int argc, char** argv) {
                 const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
                 const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
                 if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
+                // the tail without RAM copies: when an expert it gives up has no RAM copy, the experts past the cut take
+                // their RAM homes first (with the loan's), so the CPU tier reads them from RAM, not from the file; when
+                // every one has a copy, the loan's homes are left to the request's admission (loan_homes)
+                if (!kv_tail_copies && src.complement_ready() &&
+                    basalt::program::cut_gives_up_bare(host_res, xcache.slots_after_shrink(keep), g.n_expert,
+                                                       [&](int64_t l, int64_t x) { return src.has_resident(l, x); })) {
+                    std::string he;
+                    if (!home_given_up(xcache.slots_after_shrink(keep), he))
+                        basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the experts the tail gives up "
+                                             "without a copy (%s): they are read from the file", he.c_str());
+                }
                 if (!xcache.shrink(keep, e)) return false;
                 const int64_t live = xcache.slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
@@ -7223,15 +7256,9 @@ int main(int argc, char** argv) {
         const int64_t kv_host_cross = (int64_t) basalt::core::exp_flag("kv_host_cross", 99328);
         // a test's stand-in for the RAM free now, MiB (forces the fallback); negative: MemAvailable
         const int64_t kv_host_ram = (int64_t) basalt::core::exp_flag("kv_host_ram_mib", -1);
-        // a pin leaves the guard's floor free and what serving can still take: its budget less the part the session
-        // holds now (the running checkpoints, the parked conversations; each counted up to its own share)
-        const ServeGrowth kv_host_budget = serve_growth(o, g);
+        // a pin leaves the guard's floor free and what serving can still take: its budget less the part it holds now
         auto kv_host_kept = [&]() -> uint64_t {
-            uint64_t ck = 0;
-            for (const ConvCheckpoint& c : checks) ck += c.bytes();
-            const uint64_t held = std::min<uint64_t>(ck, kv_host_budget.checkpoints) +
-                                  std::min<uint64_t>(conversations.bytes(), kv_host_budget.conversations);
-            return basalt::program::kv_host_keep(guard_floor, kv_host_budget.total(), held);
+            return basalt::program::kv_host_keep(guard_floor, serve_budget.total(), serve_held());
         };
         if (kv_host_live)
             basalt::log::info("basalt serve", "host K/V: on, %lld-cell slot pool, streamed from %lld cells, %.2f GiB of RAM "
@@ -7437,16 +7464,18 @@ int main(int argc, char** argv) {
         // the next window reaching `need` cells, its first `live_c` cells written): a larger pool when the RAM above the
         // guard's floor takes it, else back to the VRAM tail.  1 done, 0 neither (`e`: the request stops there), -1 failed.
         auto kv_host_more = [&](int64_t p, int64_t need, int64_t left, int64_t live_c, std::string& e) -> int {
+            const int64_t had = kv_pool.cells();
+            // a pool of the whole context holds every cell a window writes (none goes past it), as the tail does there
+            if (had >= ss.max_cells) return 1;
             const auto t0 = Clock::now();
             if (!kv_drain(e)) return -1;
-            const int64_t had = kv_pool.cells();
             const int64_t cells = kv_host_pin_cells(need, left);
             const uint64_t bytes = basalt::core::KvHostPool::bytes_for(ss, g, cells);
             const uint64_t avail = kv_host_grow_ram >= 0 ? (uint64_t) kv_host_grow_ram << 20 : kv_ram_now();
             // the keep admission uses (it is never below the RAM homes' floor)
             const uint64_t floor = std::max<uint64_t>(guard_floor + (256ull << 20), kv_host_kept());
             auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
-            std::string pe = cells <= had ? "the context is full" : "no RAM";
+            std::string pe = "no RAM";
             if (cells > had && avail > floor && bytes <= avail - floor) {
                 const int r = kv_host_regrow(cells, live_c, pe, e);
                 if (r < 0) return -1;
@@ -7457,7 +7486,6 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            if (cells <= had) { e = "host K/V: the request's " + std::to_string(had) + " pinned cells are used up"; return 0; }
             const std::string why = pe;
             const int r = kv_host_to_vram(p, live_c, pe, e);
             if (r < 0) return -1;
@@ -7498,12 +7526,10 @@ int main(int argc, char** argv) {
             // scanned, the first refused one is resampled under the mask, and the segment ends there
             std::unique_ptr<basalt::program::grammar::Guard> guard;
             // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
-            // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
-            // history and last proposal
+            // their probabilities for the slot's next window, its prompt-lookup history and last proposal
             int32_t dr[16] = {};
             float dprob[16] = {};
             int n_dr = 0;
-            basalt::core::DraftCumAdapt cum;
             std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
             int32_t sbuf[16] = {};
             int sk = 0, smatch = 0;
@@ -7518,6 +7544,7 @@ int main(int argc, char** argv) {
         const bool batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
         const int S_all = S;
         basalt::spec::DraftPolicy bpolicy(S);   // the lookup-or-MTP choice, costs per row
+        const float cum_th = basalt::core::draft_cum_th();   // the draft-length rule's threshold
         double bt_draft = 0, bt_draft_last = 0;
         int64_t bt_slotwin = 0, bt_dr_off = 0, bt_dr_acc = 0;
         std::vector<std::pair<std::vector<int32_t>, uint64_t>> bscript((size_t) std::max(o.batch, 0));
@@ -7955,7 +7982,7 @@ int main(int argc, char** argv) {
                 for (int sg = 0; sg < S; ++sg) {
                     BSlot& sl = bs[(size_t) rows[sg]];
                     int T = 1;
-                    while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, sl.cum.th())) ++T;
+                    while (T < S_mtp && T - 1 < sl.n_dr && basalt::core::draft_keep(sl.dprob, T - 1, cum_th)) ++T;
                     sl.from_sfx = false;
                     sl.sk = 0;
                     if (sl.sfx && sl.n_dr > 0) {
@@ -8155,9 +8182,8 @@ int main(int argc, char** argv) {
                 }
                 std::printf("\n");
                 sl.produced += k;
-                if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
+                if (real) {   // the window's verdict on its drafts: the lookup history, the policy
                     const int a = k - 1, Tw = lens[sg];
-                    if (Tw > 1 && !sl.from_sfx) sl.cum.observe(sl.dprob, Tw - 1, a);
                     if (Tw > 1) sl.acc = 0.8 * sl.acc + 0.2 * ((double) a / (double) (Tw - 1));
                     sl.drafts_offered += Tw - 1;
                     sl.drafts_accepted += a;
@@ -8216,7 +8242,7 @@ int main(int argc, char** argv) {
                     mtp.set_ple_session(bslot_ss[0][(size_t) b].get());
                     sl.n_dr = 0;
                     if (ci < nfull) {
-                        mtp.set_cum_th(sl.cum.th());
+                        mtp.set_cum_th(cum_th);
                         int nd = 0;
                         if (!mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err, sl.dprob,
                                            &nd)) {
@@ -8558,8 +8584,10 @@ int main(int argc, char** argv) {
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
             // the chunk teacher-forced through verify windows of T tokens, every token committed; ppl_score=0
-            // forces the same tokens through the same windows without scoring or writing rows (a timing mode)
-            int req_ppl = -1, req_ppl_t = 3, req_ppl_score = 1;
+            // forces the same tokens through the same windows without scoring or writing rows (a timing mode);
+            // ppl_force=1 drafts and sizes the windows as decoding does and judges the drafts against the chunk's
+            // tokens, so every drafting rule writes the same text (a timing mode for drafting, rows not scored)
+            int req_ppl = -1, req_ppl_t = 3, req_ppl_score = 1, req_ppl_force = 0;
             int req_clip = 0;   // clip=1 (GENT): max_new is a cap, cut to the room the context leaves after the prompt
             if (endp != nullptr) {   // GENI takes the same keys (image requests were always greedy); its
                                      // embedding file path is the first token without an =
@@ -8591,6 +8619,7 @@ int main(int argc, char** argv) {
                     else if (key == "ppl") req_ppl = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_t") req_ppl_t = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ppl_score") req_ppl_score = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "ppl_force") req_ppl_force = std::atoi(tok.c_str() + eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -10424,7 +10453,7 @@ int main(int argc, char** argv) {
             }
             std::vector<int32_t> drafts((size_t) std::max(S, basalt::core::kMtpChainMax), 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob((size_t) std::max(S, basalt::core::kMtpChainMax), 0.0f);
-            basalt::core::DraftCumAdapt cum_adapt;   // this request's draft threshold
+            const float cum_th = basalt::core::draft_cum_th();   // the draft-length rule's threshold
             std::vector<int32_t> sbuf((size_t) S, 0);
             if (o.suffix_draft > 0) {
                 sfx.reset();
@@ -10502,18 +10531,19 @@ int main(int argc, char** argv) {
                 int T = 1;
                 if (held.on) T = held.T;
                 else
-                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_th)) ++T;
                 if (first_window) T = (int) (n - fold_p0);
                 const int e0 = first_window ? T - 1 : 0;   // rows before it are prompt tokens: forced, not emitted
+                const bool forced = ppl != nullptr && req_ppl_force != 0;
                 if (ppl != nullptr) {
                     if (p >= ppl->end()) break;
-                    T = (int) std::min<int64_t>(req_ppl_t, ppl->end() - p);
+                    T = (int) std::min<int64_t>(forced ? T : req_ppl_t, ppl->end() - p);
                 }
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window && ppl == nullptr && !held.on) {
+                if (o.suffix_draft > 0 && !first_window && (ppl == nullptr || forced) && !held.on) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
@@ -10521,6 +10551,7 @@ int main(int argc, char** argv) {
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
                 }
+                if (forced) T = (int) std::min<int64_t>(T, ppl->end() - p);   // a lookup window ends at the base's last token too
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
@@ -10530,7 +10561,7 @@ int main(int argc, char** argv) {
                     for (int i = 0; i < T; ++i) window[(size_t) i] = held.win[(size_t) i];
                 if (e0 > 0)
                     for (int i = 1; i < T; ++i) window[(size_t) i] = (int32_t) ids[(size_t) (p + i)];
-                if (ppl != nullptr)
+                if (ppl != nullptr && !forced)
                     for (int i = 0; i < T; ++i) window[(size_t) i] = ppl->token(p + i);
                 // the guess: this window is accepted whole and the target's next token is the chain's draft T - 1; the next
                 // window then holds that draft and the ones the chain made after it
@@ -10541,7 +10572,7 @@ int main(int argc, char** argv) {
                     n_chain = mtp.draft_more(n_chain, drafts.data(), dprob.data());   // made beside this window's stage 0
                     if (n_chain <= T || !basalt::core::draft_keep(dprob.data(), T - 1, kPairTheta)) return 0;
                     int tb = 1;
-                    while (tb < S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, cum_adapt.th()))
+                    while (tb < S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, cum_th))
                         ++tb;
                     if (tb < 2) return 0;
                     wb[0] = drafts[(size_t) T - 1];
@@ -10627,6 +10658,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
+                if (forced)   // the chunk's tokens stand in for the target's picks
+                    for (int t = 0; t < T; ++t) outv[(size_t) t] = ppl->token(p + t + 1);
                 int a = 0;
                 if (e0 > 0) {
                     for (int i = 0; i < e0; ++i) outv[(size_t) i] = window[(size_t) i + 1];
@@ -10672,7 +10705,7 @@ int main(int argc, char** argv) {
                         ++grammar_resamples;
                     }
                 }
-                if (ppl != nullptr) {   // every row scored (unless ppl_score=0) and committed
+                if (ppl != nullptr && !forced) {   // every row scored (unless ppl_score=0) and committed
                     a = T - 1;
                     for (int t = 0; t < T; ++t) {
                         if (req_ppl_score != 0) {
@@ -10842,8 +10875,7 @@ int main(int argc, char** argv) {
                     ++rounds;
                     const Clock::time_point tw2 = Clock::now();
                     basalt::core::decode_gaps().mark(5);
-                    if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
-                    mtp.set_cum_th(cum_adapt.th());
+                    mtp.set_cum_th(cum_th);
                     bool drafted = true;
                     if (hold) {
                         // the tokens go out; the next window's last stage runs behind this window's commit while its first
@@ -10874,8 +10906,8 @@ int main(int argc, char** argv) {
                     } else if (will_draft && mtp_on) {
                         mtp.set_launch_hook(after_launch);
                         pair_hint = pair_req && full_ema >= kPairFull;
-                        mtp.set_cum_th(pair_hint ? cum_adapt.th() * kPairChainScale : cum_adapt.th());
-                        mtp.set_host_th(cum_adapt.th());
+                        mtp.set_cum_th(pair_hint ? cum_th * kPairChainScale : cum_th);
+                        mtp.set_host_th(cum_th);
                         drafted = mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), err, dprob.data(), &n_chain);
                         mtp.set_launch_hook(nullptr);
                         if (drafted && pipe_on) {   // the next window's first stage starts after the chain's kernels
@@ -10955,8 +10987,7 @@ int main(int argc, char** argv) {
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
                 basalt::core::decode_gaps().mark(5);
-                if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
-                mtp.set_cum_th(cum_adapt.th());
+                mtp.set_cum_th(cum_th);
                 const bool drafted = eos || produced_n >= max_new || !mtp_on ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
                 {
@@ -11521,7 +11552,7 @@ int main(int argc, char** argv) {
         int32_t x = (int32_t) tok;
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
-        basalt::core::DraftCumAdapt cum_adapt;
+        const float cum_th = basalt::core::draft_cum_th();
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
         // the first window is the last prompt token alone (it produces the first generated token and the MTP's
         // first cell)
@@ -11550,7 +11581,7 @@ int main(int argc, char** argv) {
             int T = S_mtp;
             if (use_mtp) {
                 T = 1;
-                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
+                while (T < S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_th)) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;
@@ -11624,8 +11655,7 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            if (use_mtp && !from_sfx) cum_adapt.observe(dprob.data(), T - 1, a);
-            if (use_mtp) mtp.set_cum_th(cum_adapt.th());
+            if (use_mtp) mtp.set_cum_th(cum_th);
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data());
             if (adapt_thr.joinable()) adapt_thr.join();

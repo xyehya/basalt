@@ -253,6 +253,15 @@ int main() {
         in.fresh_cells = 0;                         // no limit
         CHECK(plan_kv_host(in, 0).act == KvHostAct::take);
     }
+    {   // a cache cut gives up a bare expert only when one past the cut has no RAM copy
+        const std::vector<int32_t> res = {0, 5, -1, 9, 3, 7};   // 2 layers x 3 experts
+        auto all = [](int64_t, int64_t) { return true; };
+        auto not_l1e0 = [](int64_t l, int64_t e) { return !(l == 1 && e == 0); };   // expert 3, slot 9
+        CHECK(!cut_gives_up_bare(res, 6, 3, all));        // every expert past the cut has a copy: nothing to home
+        CHECK(cut_gives_up_bare(res, 6, 3, not_l1e0));    // slot 9 goes and has none
+        CHECK(!cut_gives_up_bare(res, 10, 3, not_l1e0));  // ... unless the cut keeps it
+        CHECK(!cut_gives_up_bare(res, 0, 0, not_l1e0));   // no geometry
+    }
     {   // a pool that cannot grow still serves a request when it holds the prompt and the next decode window
         CHECK(kv_host_pool_serves(131072, 120000, 2112));
         CHECK(kv_host_pool_serves(131072, 128960, 2112));
