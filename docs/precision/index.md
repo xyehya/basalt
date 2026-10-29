@@ -96,6 +96,7 @@ Unlike llama.cpp, Basalt does not quantize the activations of the hc read to Q8_
 | KV cache (`--kv`) | fp16, int8, q4_0 (alias q4), k8v4 (int8 K, rotated Q4_0 V). Engine default fp16; the sample config in the README uses int8 | generate.cpp (`--kv` parse; qsa_set_kv_int8, qsa_set_kv_q4); docs/configuration/ |
 | int8 KV layout | int8 codes with an fp16 scale per 64 values (4 per 256-wide head, separate for K and V), scale = f16(amax/127) | kv_q8.hpp:3-5, 21-23; kv_q8.cu:46-52 |
 | Host K/V (serve, deep requests) | The same K/V bytes in pinned RAM, read through a VRAM pool of slots; attention reads the same values, so decode equals the VRAM tail's at the same expert placement. A prompt read on a streamed session also carries the staging pool (one layer's K/V at the context) in the prompt path's loan, so more cache slots are lent; in a chunk below the stream-all size the CPU share then takes other experts and the read's K/V can differ in the last bits, as with any other loan (a 4,113-token tail at 128K, teacher-forced over 148 tokens: top-1 149/150, mean abs dNLL 0.013 against the VRAM tail; a CPU-share change from 0.6 to 0.5 on the VRAM tail gives 148/150 and 0.027; with `--prefill-cpu-share 0` the greedy outputs are identical). Streaming gives the tail's VRAM to expert slots, which moves placement (more GPU hits, a different CPU/GPU split), so free-running text can differ from a build without it | layer.cpp (qsa_state_set_mode); kv_stream.hpp; prefill.cpp (take_stage); kv_mode_switch_test |
+| Elastic KV floor and step (serve) | A session backs 8192 cells at start and its prompt plus 8192 per request, and gives back what a later, shorter request or a streamed slot pool does not use (on the floor's 8192-cell grid); the rest of the KV's VRAM holds expert slots. The K/V values do not change, but the floor and step set how many slots a request decodes with, which moves placement (which experts the GPU or the CPU computes), so free-running text can differ from a build with other values | generate.cpp (kKvElasticFloor, kKvGrowCells, kv_fit), kv_arena.cpp (the grid) |
 | Attention | K/V dequantized to fp32; scores in fp32; online softmax per 64-cell chunk in fp32 (`__expf`), fp32 merge; output gate sigmoid, then q8_1 for the o-projection | qsa_dec_attn.cu:138, 255-427 |
 | Draft-only attention | fp16 mma kernel; it changes drafts only, never accepted tokens | qsa_dec_attn.cu:429-431 |
 | Indexer | Keys fp16-rounded, held fp32; block scores fp32; radix top-k, ties to the lowest cell | native_qsa_indexer.hpp:11-16; qsa_select.hpp:13-14 |
@@ -139,7 +140,9 @@ only on the routing and the tiers, and prefill is reproducible bit for bit betwe
 (six identical greedy outputs on the NVFP4 pack and on Q4_K_XL). A different tier layout (cache size, peer slots) moves the
 CPU's experts and with them the rounding, so identity checks compare sessions of one configuration. With `--parallel`
 a prompt read that runs alone (up to 16384 tokens, or any read while no slot decodes) takes the same share; a longer
-read beside decoding slots runs every expert it streams on the GPU.
+read beside decoding slots runs every expert it streams on the GPU. The experts the decoding slots routed lately stay in
+VRAM while such a read takes cache slots (they trade places with less-routed ones), so which of the slots' experts the
+CPU computes meanwhile follows their routing, as with any tier layout.
 
 **Expert path by chunk size.** A prompt chunk of fewer than 6,144 tokens stages only the experts its tokens route to and
 runs them on MMQ, or on the FP4 tensor cores for NVFP4 experts from 1,024 tokens (the FP4 row above), with the CPU pool taking the low-row non-resident ones; a chunk of 6,144 tokens
@@ -163,7 +166,8 @@ whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding 
 tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
 256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move. With `--parallel` a
 read that runs alone chunks as the single-stream path does; a read beside decoding slots takes the smaller chunk its
-capped loan allows, so the same prompt's K/V can differ in the last bits between the two.
+capped loan allows, so the same prompt's K/V can differ in the last bits between the two. A read beside decoding slots
+that gives way to a shorter request reads its rest later in the same chunks, beside the slots, with no CPU share.
 
 **Short first chunk.** A prompt above the chunk cap (and at least 32,768 tokens) reads its first 16,384 tokens as one
 chunk and the rest in equal chunks of at most the cap, so the first chunk waits for fewer PLE rows. This moves the chunk

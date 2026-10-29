@@ -444,11 +444,11 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
 bool kv_elastic_state(const QsaShapes& s, const KvPlan& p) {
     return g_kv_elastic > 0 && p.mode == 0 && s.idx_block > 0 && s.page_size % s.idx_block == 0;
 }
-// The slot pages an elastic state can stream with (0: it cannot): whole pages of g_kv_host cells within the floor (the
-// slots stay backed whatever the depth), never more than the state's pages; the hybrid K8V4 layout has no streamed form.
+// The slot pages an elastic state can stream with (0: it cannot): whole pages of g_kv_host cells (the server keeps them
+// backed while the state streams), never more than the state's pages; the hybrid K8V4 layout has no streamed form.
 int64_t kv_host_slots(const QsaShapes& s, const KvPlan& p, bool hybrid) {
     if (g_kv_host <= 0 || hybrid || !kv_elastic_state(s, p)) return 0;
-    const int64_t slots = std::min<int64_t>(p.pages, std::min(g_kv_host, g_kv_elastic) / s.page_size);
+    const int64_t slots = std::min<int64_t>(p.pages, g_kv_host / s.page_size);
     return slots * s.page_size >= qsa_kv_resident_min() ? slots : 0;   // one verify window's selections must fit
 }
 uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
@@ -553,6 +553,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             a->set_contents(n_kv + 1, std::move(rope_cos_host));
             a->set_contents(n_kv + 2, std::move(rope_sin_host));
         }
+        // mapped on the floor's grid: a deep request's pages go back to a shallower one, or to a streamed slot pool
+        a->set_extent_cells(g_kv_elastic);
         if (!a->map(std::min(g_kv_elastic, max_cells), err)) {
             basalt::log::error("basalt", "elastic KV: %s", err.c_str());
             delete a;

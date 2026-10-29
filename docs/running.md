@@ -21,13 +21,13 @@ share a long system prompt read it once.
 
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
-With `--max-context` above 32768 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
-fine): each session backs its first 32768
+With `--max-context` above 8192 the KV cache is elastic (not with `--kv-resident` or `--vram-elastic`; a peer card is
+fine): each session backs its first 8192
 cells at startup (the K/V pools, the indexer's block keys, the RoPE tables and the draft layer's K/V alike), and the
-rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 16384 cells before the prompt is read (and 16384 more whenever decode runs past that) by taking
+rest of that VRAM holds the expert cache's last slots until a request needs it. A request backs its prompt plus 8192 cells before the prompt is read (and 8192 more whenever decode runs past that) by taking
 those slots back; their experts become CPU misses read from their RAM copies, which the RAM copy keeps for exactly this.
 The next request that needs less gives the cells back and the cache refills the slots from RAM. A short request so
-decodes with the cache a 32k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
+decodes with the cache an 8k context would have, whatever `--max-context` is. With `--parallel` every slot is elastic
 once its share of the context is above 4096 tokens: it backs 4096 cells at startup and grows by 4096, so idle and short
 slots leave their VRAM to the expert cache. The startup line `elastic KV: ...` says
 how much of the cache is lent this way, and each move is logged (`elastic KV: N cells backed ...`). The cache never goes
@@ -36,7 +36,7 @@ the cells they do not hold, is refused with that error, and a reply that grows p
 slot ends as at its length limit); the engine keeps running.
 
 A request that starts decoding at 99328 tokens or deeper keeps its K/V in pinned RAM instead (the host K/V): attention
-reads it through a VRAM pool of 32768 cells, so the cache keeps its tail slots. A conversation switches at a turn that
+reads it through a VRAM pool of 32768 cells (backed while it streams), so the cache keeps its tail slots. A conversation switches at a turn that
 reads at most 32768 new prompt tokens (a continuation); a turn that reads a longer prompt stays in VRAM, since a long
 streamed read costs more than its decode wins back, and the conversation's next turn switches. The pin covers the
 prompt, up to 16384 new tokens and 4096 more, on a 16384-cell grid; a reply that outgrows it gets a pool for its next
@@ -58,7 +58,10 @@ seconds at most), and it is read as in the single-stream path: the same chunks a
 share of its experts. Its first token so comes about as soon as on an idle engine. A longer prompt is read beside them:
 the prompt path runs on its own thread, the slots' decode windows keep running (their kernels take the higher stream
 priority), and the few steps that touch the draft layer or the output run between two windows, so a long prompt does
-not stop the other requests. A prompt that arrives while no other slot is decoding is read as in the single-stream
+not stop the other requests. A much shorter request that arrives meanwhile goes first at the end of the long prompt's
+current chunk; the rest of the long prompt is read after it, beside the slots, in the same chunks. The cache slots its loan and its KV take hold, before they are taken, only experts the
+decoding slots route least: the ones they routed lately trade places with less-routed experts of their layer, so the
+slots keep their experts in VRAM while the prompt is read. A prompt that arrives while no other slot is decoding is read as in the single-stream
 path.
 
 On one card, a batch window's layer with enough CPU misses sends a share of them over PCIe: CUDA0 copies them from
@@ -172,8 +175,9 @@ per slot, `gpus` with `util`, `power` and `temp` per card) and the fastest reque
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
 
-- `--vram-reserve-mib` below 256 is refused at startup: with less VRAM free once everything is loaded, a later
-  allocation can make the driver page GPU memory and requests stall.
+- `--vram-reserve-mib` below 256 is refused at startup on Windows and WSL2: with less VRAM free once everything is
+  loaded, a later allocation can make the driver page GPU memory and requests stall. On Linux, where the driver fails
+  such an allocation instead, the floor is 128.
 - When some experts are read from the SSD (they fit in neither the GPUs nor the RAM copy), the RAM copy leaves a
   floor free for the OS file cache: the RAM margin (2 GiB or 5% of the RAM, the larger) plus the larger of 3.5 GiB plus two layers'
   experts (what one prompt chunk reads from the file) and 4 GiB. The startup line `RAM floor ...` gives the figures.
