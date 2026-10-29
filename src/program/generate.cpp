@@ -7193,9 +7193,12 @@ int main(int argc, char** argv) {
                 const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
                 const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
                 if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
-                // the tail without RAM copies: the experts it gives up that have no RAM copy take their RAM homes first
-                // (with the loan's), so the CPU tier reads them from RAM, not from the file
-                if (!kv_tail_copies) {
+                // the tail without RAM copies: when an expert it gives up has no RAM copy, the experts past the cut take
+                // their RAM homes first (with the loan's), so the CPU tier reads them from RAM, not from the file; when
+                // every one has a copy, the loan's homes are left to the request's admission (loan_homes)
+                if (!kv_tail_copies && src.complement_ready() &&
+                    basalt::program::cut_gives_up_bare(host_res, xcache.slots_after_shrink(keep), g.n_expert,
+                                                       [&](int64_t l, int64_t x) { return src.has_resident(l, x); })) {
                     std::string he;
                     if (!home_given_up(xcache.slots_after_shrink(keep), he))
                         basalt::log::warn("basalt serve", "elastic KV: no RAM homes for the experts the tail gives up "
