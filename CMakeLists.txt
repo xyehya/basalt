@@ -1388,6 +1388,14 @@ if(BUILD_TESTING)
   set_tests_properties(prefill_fp8_dense_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()
 if(BUILD_TESTING)
+  # the FP16 / BF16 prompt products: a row's products the same bits at every call width, against cublasGemmEx and a
+  # double-precision reference (--bench [T...]: timings against cublasGemmEx)
+  add_executable(prefill_gemm_width_test tests/cuda/prefill_gemm_width_test.cpp)
+  target_link_libraries(prefill_gemm_width_test PRIVATE prefill kernels ggml_quants ${_gpu_blas_target} ${_gpu_runtime_target})
+  basalt_gpu_test(NAME prefill_gemm_width_test COMMAND prefill_gemm_width_test)
+  set_tests_properties(prefill_gemm_width_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+endif()
+if(BUILD_TESTING)
   # NVFP4 experts through MMQ (tile loader, per-16-scale dot, scale tail in SwiGLU) against CPU references, with a
   # microbench line
   add_executable(prefill_mmq_nvfp4_test tests/cuda/prefill_mmq_nvfp4_test.cpp)

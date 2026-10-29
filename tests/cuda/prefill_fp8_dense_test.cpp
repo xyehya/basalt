@@ -10,7 +10,8 @@
 //   - an all-zero row gives zeros;
 //   - width invariance: rows of the 512-row batch run again in batches of 37, 64 and 300 at shifted places give the
 //     same E4M3 rows, bit for bit, and products within 1e-5 of the max |y|; the rows whose products differ in any bit
-//     are counted, for this path and for the FP16 path, with the algorithm cuBLASLt runs for the shape;
+//     are counted, for this path and for the FP16 path (none may differ in either), with the algorithm cuBLASLt runs
+//     for the shape;
 // --bench [T]: microseconds per product and TFLOP/s at T rows (default 32768): the FP16 path, each FP8 scale
 // granularity (conversions, the shape's algorithm, fast accumulation), the prompt path's FP8 product, and llama.cpp's
 // MMQ on Q8_0 weights for comparison.
@@ -423,7 +424,7 @@ int check_geo(const Geo& g, bool outliers, cudaStream_t s, Gemm& gemm, fp8::Lt& 
         }
     }
     const double drel = ymax > 0 ? dmax / ymax : 0, drel16 = ymax > 0 ? dmax16 / ymax : 0;
-    if (qdiff != 0 || nbits != 0) ++fail;
+    if (qdiff != 0 || nbits != 0 || nbits16 != 0) ++fail;
     std::printf("%-18s %-8s FP16 %.2e / %.2e%s | path %.2e / %.2e (vs FP16 %.2e) | width (401 rows): %ld E4M3 rows "
                 "differ; products: %ld rows differ, max %.1e of max |y| (FP16 path: %ld, %.1e) [%s] %s\n",
                 g.name, outliers ? "outliers" : "plain", ef.rms, ef.worst, line.c_str(), e8.rms, e8.worst,
