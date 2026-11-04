@@ -18,6 +18,13 @@ void Request::drop_incoming() {
     disk_kv.reset();
 }
 
+// A request that does not go on: the conversation it would have continued goes back to the RAM tier, unless its K/V
+// is still in its files (the disk tier holds it).
+void Request::give_back_incoming() {
+    if (incoming && !disk_kv) (void) runtime_.conversations->put(std::move(*incoming));
+    drop_incoming();
+}
+
 Flow Request::restore() {
     runtime_.cur = ids;
     // The conversation cache's keys are int32: one narrow view per request, so a parked entry or a checkpoint
@@ -313,7 +320,7 @@ Flow Request::restore() {
                 return Flow::error;
             }
             runtime_.slot_held = SlotHeld{};
-            if (incoming) (void) runtime_.conversations->put(std::move(*incoming));   // the conversation it would continue
+            give_back_incoming();   // the conversation it would continue
             basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, runtime_.err.c_str());
             std::printf("ERR %s\n", runtime_.err.c_str());
             std::fflush(stdout);
@@ -366,7 +373,7 @@ Flow Request::restore() {
         // declined: the engine stays up, the solo session and its bookkeeping as they were, the conversation it
         // would continue back in the cache
         runtime_.slot_held = SlotHeld{};
-        if (incoming) (void) runtime_.conversations->put(std::move(*incoming));
+        give_back_incoming();
         basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, runtime_.err.c_str());
         std::printf("ERR %s\n", runtime_.err.c_str());
         std::fflush(stdout);
