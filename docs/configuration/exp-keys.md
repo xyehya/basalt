@@ -9,6 +9,7 @@ path, carry no stability promise, and go away when the experiment ends. A key th
 | `kv_host` | auto | The per-request host K/V of a single-GPU server ([elastic KV](../elastic-kv.md#host-kv---exp-kv_host)). `0` keeps every request's K/V in VRAM; `1` turns it on without the experts' RAM copy too, and says why when it still cannot apply. |
 | `kv_host_cross` | 99328 | A request that starts decoding at or past this many cells streams its K/V from RAM; a shallower one uses the VRAM tail. |
 | `kv_host_fresh` | 32768 | A session not yet streamed takes a host pool only for a request that reads at most this many new prompt tokens. |
+| `kv_host_lead` | 8192 | A session not yet streamed whose request starts within this many cells below `kv_host_cross` prefaults its first host pool in the background, so the take registers pages already in RAM. `0` pins at the take. |
 | `kv_host_out` | 16384 | The output cells a host pool is pinned for; a reply that writes past them grows the pool between windows. |
 | `kv_host_ram_mib`, `kv_host_grow_ram_mib` | -1 (the RAM actually free) | Test stand-ins for the free RAM, in MiB, at admission and at a mid-request grow; they force the fallbacks. |
 | `draft_th` | 0.50 | The draft-length rule's threshold: a draft joins the window while the chance that it and every draft before it are accepted is at least this. A value above 0 replaces the default. |
