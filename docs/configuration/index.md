@@ -18,7 +18,8 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 - [Sampling and thinking](sampling.md)
 - [The adaptive tier](adaptive.md)
 - [Example configurations](examples.md)
-- [Diagnostics, measurement and `--exp` flags](diagnostics.md)
+- [Diagnostics and measurement flags](diagnostics.md)
+- [Experiment keys (`--exp`)](exp-keys.md)
 
 ## How settings are given
 

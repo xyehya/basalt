@@ -125,7 +125,7 @@ Prefill and decode are different computations that read and write the same KV an
 
 | Item | Prefill | Source |
 |---|---|---|
-| Dense projections | Weights dequantized to fp16, activations rounded to fp16, cuBLAS with fp32 accumulate; BF16 tensors BF16 x BF16 with fp32 compute; no q8_1 | gemm.cu:127-198; prefill/projection.cpp:29-40 |
+| Dense projections | Weights dequantized to fp16, activations rounded to fp16, fp32 accumulate; BF16 tensors BF16 x BF16 with fp32 compute; no q8_1. Each weight shape runs one cuBLASLt algorithm at every chunk width (K in one piece, or a fixed number of parts reduced out of place), chosen from the heuristic's offers without timing and checked on the shape's first call of two or more rows (row 0 in narrower calls and a later row at place 0 must give the same bits), so a token's products are the same bits in any chunk and at any place in it; a shape with no such algorithm, or whose algorithm a call refuses, runs cublasGemmEx (`prefill_gemm_width_test`) | gemm.cu:48-532; prefill/projection.cpp:29-40 |
 | Dense projections in FP8 (`--prefill-fp8`, experimental, off) | Selected prompt products use E4M3 weights and activations with FP32 accumulation; their errors carry into subsequent decode. Numerics change from the FP16 path. The prior measurements on the original branch do not validate this merge; rerun prompt-path parity and decode-path quality against Q8_0 | prefill/gemm_fp8.cu; prefill/projection.cpp; prefill_fp8_dense_test |
 | hc matrices | Activations rounded to BF16; down/up use the int8 copy dequantized to BF16; inject uses the BF16 tensor. From 33 tokens the up product and the mix run as one kernel (the FP32 gate rows stay in registers): each gate value is one m16n8k16 chain over k from zero, the chain cuBLAS runs for that product, and the mix keeps gr_mix_r's arithmetic, so the outputs are the same bits as the two steps (`prefill_hc_up_mix_test`) | prefill/projection.cpp:16-22 (up_mix); kernels.cu (gr_up_mix_kernel); gemm.cu (bf16_w, bf16_rows) |
 | Router | BF16 activation (decode: fp32) | prefill/routing.cpp:26 |
@@ -172,7 +172,8 @@ PPL is 2.9581 against 2.9547 with the lower cutoff, a paired per-token NLL diffe
 access the cutoff stays at 2,560 (4,096 with `--peer-exclusive`).
 
 **Prompt chunk size.** A bare `--prefill auto` reads a prompt in equal chunks of at most 16384 tokens, or 32768 for packs
-whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding of its K/V, so a prompt longer than 16384
+whose expert blobs exceed 1.5 MB (NVFP4). The routed experts' MMQ tiles follow the chunk's size (the dense products do
+not), so a prompt longer than 16384
 tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
 256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move. With `--parallel` a
 read that runs alone chunks as the single-stream path does; a read beside decoding slots takes the smaller chunk its
@@ -181,7 +182,7 @@ that gives way to a shorter request reads its rest later in the same chunks, bes
 
 **Short first chunk.** A prompt above the chunk cap (and at least 32,768 tokens) reads its first 16,384 tokens as one
 chunk and the rest in equal chunks of at most the cap, so the first chunk waits for fewer PLE rows. This moves the chunk
-boundaries (GEMM tiles, so the rounding of the K/V) and nothing else: prompts up to the cap and the quality gate's
+boundaries (the routed experts' MMQ tiles, so the rounding of the K/V) and nothing else: prompts up to the cap and the quality gate's
 256-token prompt half chunk as before (the 20-chunk gate is identical to the previous build on the NVIDIA-checkpoint pack). Long-context check, 65,515-token prompt, the first 64 greedy tokens
 teacher-forced with the previous chunking's tokens, spec 1, int8 KV, 400 W: KLD of the next-token distribution against
 the previous chunking has mean 0.0032, median 0.00013, max 0.038, and the same top-1 at 64 of 64 positions. The 16-token

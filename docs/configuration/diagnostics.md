@@ -1,7 +1,7 @@
 # Diagnostics and measurement flags
 
 Flags for measuring, debugging and testing the engine. They are not settings: each is off by default, and the
-[configuration reference](index.md) lists the settings.
+[configuration reference](index.md) lists the settings. Experiment switches are on [their own page](exp-keys.md).
 
 The binary column says who takes the flag:
 
@@ -118,16 +118,3 @@ preset (`--community`, `--submitter`, `--community-file`).
 `basalt-device`, a helper in the build directory, takes `--list-devices` (every GPU the runtime sees and whether this
 build runs on it), `--link-rates` (one `pcie_h2d BUS_ID GB_PER_S` line per GPU, which `--hardware` reads) and
 `--selftest`; with no flag it prints the main GPU and the memory plan.
-
-## Experiment keys (`--exp`)
-
-`--exp NAME=VALUE[,NAME=VALUE...]` (engine) sets experiment switches. They exist to test a change, carry no stability
-promise and go away when the experiment ends. A key the engine does not read is ignored; `--exp` may be given more
-than once. In a config file: `"engine": { "exp": "host_ev=1" }`.
-
-| Key | Default | What it does |
-| --- | --- | --- |
-| `concur9_logit_hash` | 0 | `1`: print a hash of each accepted row's head logits on stderr (single-stream and batch slots). |
-| `concur5_digest` | 0 | `1`: batch slots print a `BDIG` digest of their state on stdout after each window, and windows do not overlap. |
-| `spec_log` | 0 | `1` with `--draft-log FILE`: write `FILE.tk`, each verified row's target distribution beside the drafter's top 4. |
-| `host_ev` | 0 | `1`: record events at the decode loop's graph launches; each request then prints the GPU time of a window's verify, commit and draft and the idle gap before the next window (median and mean). |
