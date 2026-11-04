@@ -62,7 +62,6 @@ int dispatch(Context& context) {
     auto& graph_hits = *context.graph_hits;
     auto& auto_lend_pct = *context.auto_lend_pct;
     auto& auto_ceiling = *context.auto_ceiling;
-    auto& prompt_file_bytes = *context.prompt_file_bytes;
     auto& stream_all_priced = *context.stream_all_priced;
     auto& prompt_peer = context.prompt_peer;
     auto& set_stream_all_min = context.set_stream_all_min;
@@ -218,7 +217,6 @@ int dispatch(Context& context) {
             .graph_hits = graph_hits,
             .auto_lend_pct = auto_lend_pct,
             .auto_ceiling = auto_ceiling,
-            .prompt_file_bytes = prompt_file_bytes,
             .pool = pool,
             .ram_floor_bytes = ram_floor_bytes,
             .pstages = pstages,

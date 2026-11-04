@@ -105,8 +105,7 @@ int cache_fill(Context& context) {
                                                               basalt::kernels::cpu::expert_layout().blob_bytes(l));
                 if (o.resident_cpu_experts && o.resident_budget == 0) {
                     file_headroom =
-                        std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), outside, outside, largest,
-                                                    basalt::platform::kPromptFileReadBytes) + late);
+                        std::max(headroom, basalt::platform::ram_floor(basalt::platform::ram_margin(), 1, largest) + late);
                     ram = *free_ram > file_headroom ? *free_ram - file_headroom : 0;
                     if (o.resident_soft) ram = ram > (256ull << 20) ? ram - (256ull << 20) : 0;
                 }

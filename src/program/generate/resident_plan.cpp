@@ -147,8 +147,6 @@ int resident_plan(Context& context) {
     for (int64_t l = 0; l < g.n_layers; ++l)
         largest_layer_bytes = std::max<uint64_t>(largest_layer_bytes,
                                                  (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l));
-    // what a prompt chunk reads from the file for the lent slots the RAM copy leaves out (see platform::file_cache_floor)
-    uint64_t prompt_file_bytes = 0;
     // --serve: free places in the RAM copy take the evicted experts (no exchange buffers)
     const bool adapt_fast_on = o.serve && o.adapt_every > 0 && o.adapt_swaps > 0;
     // A server also leaves room for what it allocates after the RAM copy, before it is ready (the top-up below takes
@@ -223,16 +221,13 @@ int resident_plan(Context& context) {
         const uint64_t spares_full = adapt_fast_on ? (uint64_t) o.adapt_swaps * kSatBoost * blob : 0;
         const uint64_t spares_excl =
             adapt_fast_on ? (uint64_t) (o.adapt_swaps * kSatBoost + std::max(o.peer_adapt_swaps, o.adapt_swaps)) * blob : 0;
-        // the lent slots' copies and the spares are kept as far as RAM allows: they do not decide whether the complement fits
-        in.extra_full = lent_bytes + spares_full;
-        in.extra_peer_excl = lent_bytes + spares_excl;
-        // the floor when the whole complement is placed is the headroom; with experts left on the SSD the plan adds the file cache's
-        in.floor_bytes = head;
-        in.margin_bytes = margin;
-        in.late_bytes = late;
-        in.layer_bytes = largest_layer_bytes;
-        prompt_file_bytes = std::min<uint64_t>(lent_bytes, basalt::platform::kPromptFileReadBytes);
-        in.prompt_file_bytes = prompt_file_bytes;
+        in.complement_full += lent_bytes + spares_full;
+        in.complement_peer_excl += lent_bytes + spares_excl;
+        auto fits_beside = [&](uint64_t c) { return in.ram_available > head && c <= in.ram_available - head; };
+        // the floor when the whole complement is placed is the headroom; with experts left on the SSD it adds the file cache's
+        in.floor_bytes = fits_beside(in.complement_full) || (in.peer && in.serve && fits_beside(in.complement_peer_excl))
+                             ? head
+                             : std::max(head, basalt::platform::ram_floor(margin, 1, largest_layer_bytes) + late);
         bp::AutoGiven& gv = in.given;
         if (!(in.peer && in.serve) || o.peer_exclusive_given) {   // not applicable, or given
             gv.peer_exclusive = true;
@@ -302,7 +297,6 @@ int resident_plan(Context& context) {
     context.auto_ceiling = &auto_ceiling;
     context.open_peer = open_peer;
     context.largest_layer_bytes = &largest_layer_bytes;
-    context.prompt_file_bytes = &prompt_file_bytes;
     context.adapt_fast_on = &adapt_fast_on;
     context.late = &late;
     context.resident_headroom_base = &resident_headroom_base;
