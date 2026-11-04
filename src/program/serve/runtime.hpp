@@ -90,6 +90,7 @@ struct Context {
     const bool& graph_hits;
     int64_t& auto_lend_pct;
     int64_t& auto_ceiling;
+    uint64_t& prompt_file_bytes;
     basalt::kernels::cpu::ExpertPool& pool;
     uint64_t& ram_floor_bytes;
     std::vector<std::unique_ptr<engine_local::PromptStage>>& pstages;

@@ -127,6 +127,7 @@ struct Context {
     int64_t* auto_ceiling = nullptr;
     std::function<bool(bool)> open_peer;
     uint64_t* largest_layer_bytes = nullptr;
+    uint64_t* prompt_file_bytes = nullptr;
     const bool* adapt_fast_on = nullptr;
     const uint64_t* late = nullptr;
     const uint64_t* resident_headroom_base = nullptr;

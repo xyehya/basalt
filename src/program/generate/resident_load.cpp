@@ -25,6 +25,7 @@ int resident_load(Context& context) {
     auto& kMaxAutoChunk = *context.kMaxAutoChunk;
     auto& auto_ceiling = *context.auto_ceiling;
     auto& largest_layer_bytes = *context.largest_layer_bytes;
+    auto& prompt_file_bytes = *context.prompt_file_bytes;
     auto& adapt_fast_on = *context.adapt_fast_on;
     auto& late = *context.late;
     auto& resident_headroom_base = *context.resident_headroom_base;
@@ -63,7 +64,8 @@ int resident_load(Context& context) {
             const uint64_t margin = basalt::platform::ram_margin();
             const uint64_t copy = std::min(o.resident_budget > 0 ? o.resident_budget : auto_resident_bytes, complement);
             const uint64_t file_bytes = complement - copy;
-            ram_floor_bytes = basalt::platform::ram_floor(margin, file_bytes, largest_layer_bytes);
+            ram_floor_bytes =
+                basalt::platform::ram_floor(margin, file_bytes, complement, largest_layer_bytes, prompt_file_bytes);
             if (avail > 0 && file_bytes > 0) {
                 const uint64_t safe = basalt::platform::max_safe_copy(avail, late, ram_floor_bytes);
                 constexpr double kGiB = 1073741824.0;
