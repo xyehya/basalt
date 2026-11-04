@@ -150,6 +150,11 @@ bool Runtime::cache_regrow(std::string& e) {
     return true;
 }
 
+// the cells a session never goes below: the floor, and while it streams its slot pool (the capped K/V arrays)
+int64_t Runtime::kv_keep_cells(const basalt::core::SessionState& s) {
+    return basalt::core::session_kv_mode(s) == 1 ? std::max(kv_floor, kKvHostSlotCells) : kv_floor;
+}
+
 // The experts the KV just took CUDA0's slots from take the peer's slots of less-routed experts (by the routing counts,
 // then the profile's rank), so the next most-routed experts stay on a GPU while the KV holds CUDA0's tail.  Between
 // windows: the copies come from the RAM copy and land before it returns.
@@ -245,7 +250,7 @@ bool Runtime::peer_due_apply(std::string& e) {
 bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& e, bool shrink, int64_t min_cells) {
     kv_short = false;
     if (kv_floor <= 0) return true;
-    cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
+    cells = std::min<int64_t>(std::max<int64_t>(cells, kv_keep_cells(s)), s.max_cells);
     int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
     if (add <= 0) return true;
     const auto t0 = Clock::now();
@@ -346,7 +351,7 @@ bool Runtime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::string& 
 
 bool Runtime::kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e) {
     if (kv_floor <= 0) return true;
-    cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
+    cells = std::min<int64_t>(std::max<int64_t>(cells, kv_keep_cells(s)), s.max_cells);
     if (basalt::core::session_kv_bytes_for(s, basalt::core::session_kv_cells(s)) <=
         basalt::core::session_kv_bytes_for(s, cells)) return true;
     const auto t0 = Clock::now();

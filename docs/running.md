@@ -30,7 +30,8 @@ share a long system prompt read it once.
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
 With `--max-context` above 32768 the KV cache is elastic: a session takes VRAM from the expert cache's last slots only
-when a request needs it, and gives it back after ([elastic KV](elastic-kv.md)).
+when a request needs it, and gives it back after; a deep request keeps its K/V in pinned RAM instead when the RAM holds
+it ([elastic KV](elastic-kv.md)).
 
 While other slots are decoding, a new prompt of up to 16384 tokens is read at once: the slots wait for it (a few
 seconds at most), and it is read as in the single-stream path: the same chunks and streamed ring, the CPU pool's
