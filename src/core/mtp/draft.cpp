@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "basalt/core/spin_wait.hpp"
 
 namespace basalt::core {
 
@@ -95,8 +96,9 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         prefetch_ple(tokens[a]);
         auto wait_step = [&](int j) {
             uint32_t spins = 0;
+            SpinWait spin;
             while (((volatile int32_t*) h_out_)[j] < 0) {
-                basalt::platform::cpu_relax();
+                spin();
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
         };
