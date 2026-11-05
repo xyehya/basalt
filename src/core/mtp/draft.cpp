@@ -99,7 +99,9 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
             SpinWait spin;
             while (((volatile int32_t*) h_out_)[j] < 0) {
                 spin();
-                if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
+                // the stream is the fallback when the graph ends without writing the step: query it more often
+                // once the wait yields, since each check then takes a scheduler round trip
+                if ((++spins & (spin.yielding() ? 63u : 1023u)) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
         };
         wait_step(0);

@@ -20,7 +20,6 @@
 
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/native_head.hpp"
-#include "basalt/platform/compiler.hpp"
 #include "basalt/core/native_dense.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/core/session.hpp"
