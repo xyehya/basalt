@@ -101,6 +101,8 @@ Its microbench took 2.81 µs for 4,096 rows at 957 GB/s.
 
 A second fixed-context comparison isolates FP8 from FP16: RTX 5090 at 475 W, `--max-context 32768`, `--spec 5`, one cold `conv` fixture per process, fixed seed 1, and `--expert-cache 3072` (3,070 expert slots on the GPU and 2 in RAM for every run). The order was FP16–FP8–FP8–FP16. The prompt and context capacity were identical; cache formats produced different completions, so window time and passes/s are the comparable decode measures.
 
+The fixture is the standard short `conv` prompt, so this compares decode at the same 32k capacity and prompt, not decode after filling 32k tokens. Attempts to run a 16k active-context WikiText prompt or the 16k prefill fixture exited with `f32_rows_dot: an illegal memory access was encountered`; those runs were excluded.
+
 | KV format | Mean ms/window | Mean passes/s | Mean tok/s | Output tokens |
 | --- | ---: | ---: | ---: | ---: |
 | FP16 | 5.406 | 185.0 | 384.6 | 1,158 |
