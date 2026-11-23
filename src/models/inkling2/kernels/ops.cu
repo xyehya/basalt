@@ -233,12 +233,15 @@ __device__ __forceinline__ void store_kv4(void* cache, bool fp8, size_t idx, flo
     }
 }
 
-// A lane's four INT8 codes of a head row (channels lane * 4..), and its half-warp's scale by the half-warp's first lane.
+// A lane's four INT8 codes of a head row (channels lane * 4..), its half-warp's scale by the half-warp's first lane, and
+// the row's zero padding by the last.
 __device__ __forceinline__ void store_int8x4(void* row, int lane, float v0, float v1, float v2, float v3, const float (&scale)[2]) {
     const float s = scale[lane >> 4];
     const auto code = [s](float v) { return (uint32_t) (uint8_t) (int8_t) (s > 0.f ? max(-127, min(127, __float2int_rn(v / s))) : 0); };
     *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + lane * 4) = code(v0) | code(v1) << 8 | code(v2) << 16 | code(v3) << 24;
     if ((lane & 15) == 0) reinterpret_cast<__half*>(static_cast<uint8_t*>(row) + kHeadDim)[lane >> 4] = __float2half_rn(s);
+    if (lane == 31)   // the padding after the scales, zero
+        for (int b = kHeadDim + 4; b < kKvInt8RowBytes; b += 4) *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + b) = 0u;
 }
 
 // A block per row: warp w holds kv head w's 128 key and value channels (4 a lane), then three query heads and their
