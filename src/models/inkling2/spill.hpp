@@ -57,12 +57,18 @@ struct StageOp {
 /// wanted or kept one) gets the guard (kSlotGuard: the products read past a matrix's end into the next slot).
 std::vector<StageOp> stage_plan(int n_spill, const uint8_t* card, const uint8_t* want, bool kept);
 
-/// The RAM experts' card copies back to back in one address range, in spill order (the most routed first), each 256-byte
-/// aligned: copy k spans [at[k], end[k]). The copies are always a prefix of that order (a promote adds the next one, a
-/// demote drops the last), so the first m need the range's first pages(m) granules mapped.
+/// The RAM experts' card copies back to back in one address range, each 256-byte aligned: copy k spans [at[k], end[k]),
+/// in the order they were placed (a demote packs the survivors to the front), so the first m need the range's first
+/// pages(m) granules mapped.
 struct CopyLayout {
     std::vector<uint64_t> at, end;
     uint64_t gran = 0;
+    static uint64_t aligned(uint64_t bytes) { return (bytes + 255) / 256 * 256; }
+    void append(uint64_t stride) {
+        const uint64_t start = end.empty() ? 0 : aligned(end.back());
+        at.push_back(start);
+        end.push_back(start + stride);
+    }
     uint64_t bytes() const { return end.empty() ? 0 : (end.back() + gran - 1) / gran * gran; }
     uint64_t pages(int64_t m) const { return m > 0 ? (end[(size_t) m - 1] + gran - 1) / gran : 0; }
     /// How many of the first n copies stay so that dropping the rest unmaps at least `bytes` of `mapped` granules; 0 when

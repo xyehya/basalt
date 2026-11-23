@@ -95,6 +95,9 @@ Which RAM experts have a card copy changes their arithmetic (the card's q8_1 act
 placement is part of the result. With `--vram-reserve-mib 300` at `--max-context 8192` (1,049 experts planned into RAM,
 250 copied back to the card, 90.17% of decode lookups on the card), 100 chunks against the base build (no copy-back):
 PPL 7.0708 to 7.0725, paired NLL difference +0.00025 +- 0.00042, top-1 98.22% of rows the same (RTX 5080 at 360 W).
+The copies then follow the session's own lookups and the prompt loan adds more while decode runs, so which pairs the card
+computes depends on the conversation; it changes only at positions the requests fix, so a greedy request's placement, and
+its tokens, are the same on every run.
 
 RTX 5090 at 475 W, the whole model on the card, unless a row says otherwise. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512). The FP8 and INT8 quality/KLD values above predate this rebase; KLD was not rerun because the reference corpus is unavailable.
 
