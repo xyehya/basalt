@@ -91,6 +91,11 @@ PPL 7.0714. transformers' implementation on the CPU agrees with it (chunks 0 and
 | 100 chunks, `--kv fp8` (#552's build) | 0.00443 | 97.29% | 7.0702 (base 7.0644) |
 | 100 chunks, `--kv fp16` (#552's build), the same set of runs as the two rows above | 0.00310 | 97.78% | 7.0695 (base 7.0644) |
 
+Which RAM experts have a card copy changes their arithmetic (the card's q8_1 activations against the CPU's Q8_0), so
+placement is part of the result. With `--vram-reserve-mib 300` at `--max-context 8192` (1,049 experts planned into RAM,
+250 copied back to the card, 90.17% of decode lookups on the card), 100 chunks against the base build (no copy-back):
+PPL 7.0708 to 7.0725, paired NLL difference +0.00025 +- 0.00042, top-1 98.22% of rows the same (RTX 5080 at 360 W).
+
 RTX 5090 at 475 W, the whole model on the card, unless a row says otherwise. On the RTX 5060 Ti, the CPU computes experts in RAM (Ryzen 9 9950X, AVX-512). The FP8 and INT8 quality/KLD values above predate this rebase; KLD was not rerun because the reference corpus is unavailable.
 
 ## Rebased decode: INT8 vs FP8
