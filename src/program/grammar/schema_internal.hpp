@@ -38,6 +38,8 @@ struct SchemaNode {
     // Integer bounds, inclusive
     int64_t minimum = INT64_MIN;
     int64_t maximum = INT64_MAX;
+    // the bounds lie past the int64 range and admit no int64 (INT64_MIN / INT64_MAX above mean no limit)
+    bool no_integer = false;
     // String
     std::string pattern;
     Format format = FormatNone;
