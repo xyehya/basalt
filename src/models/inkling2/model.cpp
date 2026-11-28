@@ -113,7 +113,7 @@ uint64_t pool_bytes(const Geometry& g, int64_t positions, bool fp8, bool int8, u
 }
 
 uint64_t shared_bytes(const Geometry& g, bool drafter, bool head) {
-    return kSharedFixed + prompt_bytes(g) + (drafter ? dspark_tap_bytes(std::max(kBatchRows, kPromptChunk)) + (32ull << 20) : 0) +   // PROMPT, DSPARK HOOKS
+    return kSharedFixed + prompt_bytes(g, drafter) + (drafter ? dspark_tap_bytes(kBatchRows) + (32ull << 20) : 0) +   // PROMPT, DSPARK HOOKS
            (head ? kernels::sampler_wide_bytes((int) g.n_vocab) : 0);
 }
 
