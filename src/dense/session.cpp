@@ -469,6 +469,8 @@ protected:
     }
 
 public:
+    int prefill_window_rows() const override { return m_.split || m_.prompt_split ? 0 : kChunk; }
+
     Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.n_tokens == 0) return {};
         if (r.n_tokens < 0 || r.pos < 0 || r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
