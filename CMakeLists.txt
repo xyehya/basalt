@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(_basalt_cuda_arch_default ON)
 endif()
-project(basalt VERSION 0.5.7 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.6.0 LANGUAGES C CXX CUDA)
 include(cmake/target_arch.cmake)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
