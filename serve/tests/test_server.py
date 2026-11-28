@@ -133,7 +133,8 @@ class MaxTokens(unittest.TestCase):
                 self.assertIn("exceeds the context", b["error"]["message"])
                 self.assertIn("--fit-max-tokens", b["error"]["message"])     # says how to get past it
                 self.assertIn('"fit-max-tokens": true', b["error"]["message"])
-                self.assertIn('"server" section', b["error"]["message"])
+                self.assertIn('"engine" section', b["error"]["message"])     # it is a model setting, not the server's
+                self.assertNotIn('"server" section', b["error"]["message"])
                 self.assertNotIn(".json", b["error"]["message"])
                 self.assertRegex(b["error"]["message"], r"at most \d+ here")
 
