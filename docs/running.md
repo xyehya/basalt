@@ -157,7 +157,7 @@ Basalt refuses settings that would leave the machine without memory, and never s
   for the host memory the engine takes after they read the free RAM (CUDA graphs, the first request), so the free RAM settles
   above the guard, not on it. When some experts stay in the file, the
   tiers also leave the OS file cache they are read through a floor: one prompt chunk's file reads and two layers' share of
-  those experts, at least 4 GiB. Programs left idle beside a small reserve may be swapped out.
+  those experts, at least 4 GiB, and never more than the RAM the experts are short of. Programs left idle beside a small reserve may be swapped out.
 - While serving, the RAM guard holds the reserve: below it, it parks conversations to disk or drops them. A request waits up to 30 s
   for RAM to return. A running request stops with an error only when RAM is critical (under 1 GiB free, or half the reserve when smaller,
   or below the reserve under memory pressure). `--ram-reserve-mib 0` turns the guard off.

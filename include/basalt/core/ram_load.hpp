@@ -132,15 +132,19 @@ inline uint64_t file_cache_floor(uint64_t file_bytes, uint64_t want_bytes, const
 /// The RAM a tier sized by ram_tier_room(avail, reserve, pinned) also leaves free, toward `want_bytes` of experts: 0
 /// when they all fit, else the file cache's floor for the ones left in the file.  That share depends on the floor, so
 /// the iteration starts from all of them in the file and only goes down: the floor it ends on never undercounts.
+/// The keep is at most what the tier is short of: every byte of it moves an expert into the file, so a larger keep
+/// would leave more experts in the file to make room for the cache than RAM lacks, and fill that cache with them.
 inline uint64_t file_cache_keep(uint64_t avail, uint64_t reserve, bool pinned, uint64_t want_bytes, const FileCache& c) {
-    if (want_bytes <= ram_tier_room(avail, reserve, pinned)) return 0;
+    const uint64_t bare = ram_tier_room(avail, reserve, pinned);
+    if (want_bytes <= bare) return 0;
     uint64_t file = want_bytes, keep = 0;
     for (int i = 0; i < 16; ++i) {
         keep = file_cache_floor(file, want_bytes, c);
         const uint64_t room = ram_tier_room(avail, reserve + keep, pinned);
         file = want_bytes - (room < want_bytes ? room : want_bytes);
     }
-    return keep;
+    const uint64_t short_bytes = want_bytes - bare;
+    return keep < short_bytes ? keep : short_bytes;
 }
 
 /// Memory a pin takes whole large pages of: aligned to and padded to 2 MiB.

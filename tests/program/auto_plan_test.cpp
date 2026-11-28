@@ -158,8 +158,8 @@ int main() {
         CHECK(p.resident_bytes == in.ram_available - 9 * G);
         CHECK(p.resident_bytes > in.complement_full);
         in.ram_available = 28 * G;                  // it does not: the rest is read from the file, beside its cache
-        p = choose_auto(in);
-        CHECK(p.resident_bytes == 15 * G && p.resident_bytes < in.complement_full);
+        p = choose_auto(in);                        // 2.7 GiB short: the cache keeps that, not its 4 GiB minimum
+        CHECK(p.resident_bytes == 19 * G - (in.complement_full - 19 * G) && p.resident_bytes < in.complement_full);
         in.ram_available = 8 * G;                   // little RAM: no negative copy
         CHECK(choose_auto(in).resident_bytes == 0);
     }

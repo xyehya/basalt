@@ -241,6 +241,19 @@ void test_file_cache_keep() {
             "the file cache keeps at least its minimum");
     // everything in the file (no RAM above the reserve): the whole largest layer twice and a chunk
     require(file_cache_floor(want, want, FileCache{4 * kGiB, kGiB}) == 9 * kGiB + 2, "two whole layers and a chunk");
+    // a sliver short (#905: 42.71 GiB free, a 4.2 GiB reserve, a 37.6 GiB complement page-locked): the cache keeps the
+    // shortfall, not its whole floor, so about twice the sliver is left in the file instead of the floor and the sliver
+    const uint64_t tight_avail = (uint64_t) (42.71 * kGiB), tight_reserve = (uint64_t) (4.2 * kGiB);
+    const uint64_t tight_want = (uint64_t) (37.6 * kGiB);
+    const uint64_t short_bytes = tight_want - ram_tier_room(tight_avail, tight_reserve, true);
+    const uint64_t tight_keep = file_cache_keep(tight_avail, tight_reserve, true, tight_want, flash);
+    const uint64_t tight_file = tight_want - ram_tier_room(tight_avail, tight_reserve + tight_keep, true);
+    require(short_bytes > 0 && short_bytes < kGiB / 4, "the complement is a sliver short");
+    require(tight_keep == short_bytes, "the keep is the shortfall");
+    require(tight_file < kGiB / 2, "a sliver short leaves well under a GiB in the file");
+    // short by more than the floor: the whole floor, as before
+    require(file_cache_keep(30 * kGiB, tight_reserve, true, tight_want, flash) >= kMinFileCacheBytes,
+            "a tier far short keeps the whole floor");
 }
 
 void test_plan_reserve() {
