@@ -92,6 +92,10 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+        std::printf("v%s\n", BASALT_VERSION);
+        return 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
     basalt::platform::install_crash_handler();
     // if memory runs out the kernel ends this process first, not the rest of the machine

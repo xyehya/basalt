@@ -864,6 +864,13 @@ add_executable(basalt src/program/generate.cpp
                        src/program/cli/startup.cpp
                        src/program/cli/gpu.cpp)
 basalt_ship_to_bin(basalt)
+# the executable links cuBLAS, whose runtime DLL the hosted Windows runner lacks (only the development files are installed),
+# so it cannot start there; the Linux run covers the flag for every platform
+if(BUILD_TESTING AND NOT WIN32)
+  string(REPLACE "." "\\." _version_regex "${PROJECT_VERSION}")
+  basalt_cpu_test(NAME version_flag_test COMMAND basalt --version)
+  set_tests_properties(version_flag_test PROPERTIES PASS_REGULAR_EXPRESSION "^v${_version_regex}\r?\n$")
+endif()
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE models serve_shared engine_session ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)

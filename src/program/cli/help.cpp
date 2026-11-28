@@ -12,6 +12,8 @@ void usage() {
                  "    from the config file and the command line (the model is the config's or MODEL.basalt, which stands\n"
                  "    for --model); --python defaults to .venv/bin/python in the source tree, else python3; the other\n"
                  "    arguments go to the server.  It runs in the source tree; --model and --config paths are made absolute.\n"
+                 "basalt --version\n"
+                 "    prints the engine version\n"
                  "basalt generate --model FILE.basalt --tokens \"1,2,3\" [options]\n"
                  "\n"
                  "  --model FILE         the .basalt model file (required): the dense weights, experts, source tensors\n"

@@ -1,6 +1,6 @@
 # Running the server
 
-Settings: [configuration](configuration/index.md). Diagnostic flags: `bin/basalt --help`. Several models: [models and the router](configuration/models.md).
+Settings: [configuration](configuration/index.md). Diagnostic flags: `bin/basalt --help`. The engine version: `bin/basalt --version`. Several models: [models and the router](configuration/models.md).
 
 ## Start-up
 
