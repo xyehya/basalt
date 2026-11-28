@@ -1,7 +1,7 @@
 name: release-discord
 
 # A published release is announced in the Discord's #announcements through a channel webhook
-# (repository secret DISCORD_RELEASE_WEBHOOK). The announcement is a plain message: the release name, its link, the start of its notes cut at a whole line, and a link to the rest. `workflow_dispatch` announces an existing release again.
+# (repository secret DISCORD_RELEASE_WEBHOOK). The announcement is a plain message: the release name, its link, the start of its notes cut at a whole line, and a link to the rest. `workflow_dispatch` announces an existing release again, and is how release.yml announces a draft it published (a publish by the workflow's own token starts no workflow).
 on:
   release:
     types: [published]
