@@ -313,8 +313,8 @@ function drawPanes() {
 /* ---- Slots: 1 slot is one card across the panel, 2 side by side, 4 a 2x2 grid; past 4, two columns of compact rows ---- */
 const link = g => num(g.pcie_gen_max ?? g.pcie_gen) ? `Gen${g.pcie_gen_max ?? g.pcie_gen}${num(g.pcie_width) ? ` x${g.pcie_width}` : ""}` : "";
 const bar = f => `<div class="bar4"><i style="width:${(clamp(f || 0, 0, 1) * 100).toFixed(1)}%"></i></div>`;
-const kc = n => n >= 1048576 ? `${n / 1048576 >= 10 ? Math.round(n / 1048576) : +(n / 1048576).toFixed(1)}M` : kt(n).replace("k", "K");
-const kn = n => n >= 1048576 ? kc(n) : kt(n);   // a slot's context: 262k, 1M for 1,048,576
+const kc = n => n >= 1e6 ? `${n / 1048576 >= 10 ? Math.round(n / 1048576) : +(n / 1048576).toFixed(1)}M` : kt(n).replace("k", "K");
+const kn = n => n >= 1e6 ? kc(n) : kt(n);   // a slot's context: 262k, 1M from a million up
 const pctOf = (a, b) => b ? Math.round(a / b * 100) : 0;
 const slotWord = s => !s.is_processing ? "Idle" : s.state === "prefill" ? "Reading" : "Decoding";
 
