@@ -314,6 +314,7 @@ function drawPanes() {
 const link = g => num(g.pcie_gen_max ?? g.pcie_gen) ? `Gen${g.pcie_gen_max ?? g.pcie_gen}${num(g.pcie_width) ? ` x${g.pcie_width}` : ""}` : "";
 const bar = f => `<div class="bar4"><i style="width:${(clamp(f || 0, 0, 1) * 100).toFixed(1)}%"></i></div>`;
 const kc = n => n >= 1048576 ? `${n / 1048576 >= 10 ? Math.round(n / 1048576) : +(n / 1048576).toFixed(1)}M` : kt(n).replace("k", "K");
+const kn = n => n >= 1048576 ? kc(n) : kt(n);   // a slot's context: 262k, 1M for 1,048,576
 const pctOf = (a, b) => b ? Math.round(a / b * 100) : 0;
 const slotWord = s => !s.is_processing ? "Idle" : s.state === "prefill" ? "Reading" : "Decoding";
 
@@ -337,7 +338,7 @@ function slotRows(rows, series, all = rows) {
     h += `<div class="rw${run ? "" : " idle"}"><span class="p nm" style="grid-column:1" title="Slot ${s.id + 1} · ${slotWord(s)}">Slot ${s.id + 1}${dense ? `<span class="u"> · </span><span class="${run ? "api hot" : "api"}">${esc(api)}</span>` : ""}</span>`
       + `<span class="p rate e" style="grid-column:2">${rate}</span>${spark(a, max)}`
       + `<span class="p e" style="grid-column:4">${run ? `${fmt(s.generated)}${num(s.max_tokens) ? `<span class="u">/${lim(s.max_tokens)}</span>${bar(s.generated / s.max_tokens)}` : ""}` : "-"}</span>`
-      + `<span class="p e cx" style="grid-column:5">${kt(s.ctx_used || 0)}<span class="u">/${kt(s.n_ctx || 0)}</span>${bar(s.n_ctx ? s.ctx_used / s.n_ctx : 0)}</span>`
+      + `<span class="p e cx" style="grid-column:5">${kn(s.ctx_used || 0)}<span class="u">/${kn(s.n_ctx || 0)}</span>${bar(s.n_ctx ? s.ctx_used / s.n_ctx : 0)}</span>`
       + `<span class="p e" style="grid-column:6">${acc != null ? `${acc}<span class="u">%</span>` : "-"}</span>`
       + (dense ? "" : `<span class="s" style="grid-column:1">${run ? esc(api) : "Idle"}</span>`
         + `<span class="s e" style="grid-column:2">${pre ? "Read" : st ? `Avg ${Math.round(st.avg)}` : ""}</span>`
