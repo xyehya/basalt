@@ -205,7 +205,8 @@ struct Shared {
         x.ex_ng_ = (int32_t*) alloc(16);
         x.ex_dst_ = (int32_t*) alloc((size_t) pairs * 4);
         x.ex_tok_ = (int32_t*) alloc((size_t) pairs * 4);
-        x.ex_h_ = alloc(expert_h_bytes((int) pairs, g.n_ff_exp));
+        x.ex_h_ = alloc(std::max(expert_h_bytes((int) pairs, g.n_ff_exp),
+                                 bk::native_expert_scratch_bytes(pairs, g.n_ff_exp)));
         x.ex_tk_ = (int32_t*) alloc(expert_tickets() * 4);
         if (ok && cudaMemset(x.ex_tk_, 0, expert_tickets() * 4) != cudaSuccess) ok = false;
         x.ex_rows_ = f(pairs * E);
@@ -1662,7 +1663,6 @@ private:
         ec.x = x.xh_;
         ec.h = x.ex_h_;
         ec.tickets = x.ex_tk_;
-        experts_gate_up(ec, k.stream);
         MoeFinish mf;
         mf.rows = x.ex_rows_;
         mf.w = x.rw_;
@@ -1674,13 +1674,26 @@ private:
         mf.resid = x.resid_;
         mf.out = out;
         mf.tap = tap;
-        if (on_cpu) {   // the card's rows, the RAM experts' rows beside them, then the finish
-            experts_down_rows(ec, mf, rows, k.stream);
-            sh_->cpu->finish(l, rows, ids, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
-            fork_open_ = false;
+        const bool fast_experts = (w.gu_type == 40 || w.gu_type == 46) && w.d_type == w.gu_type;
+        if (fast_experts) {
+            experts_gate_up(ec, k.stream);
+            if (on_cpu) {   // the card's rows, the RAM experts' rows beside them, then the finish
+                experts_down_rows(ec, mf, rows, k.stream);
+                sh_->cpu->finish(l, rows, ids, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
+                fork_open_ = false;
+                experts_finish(ec, mf, rows, k.stream);
+            } else {
+                experts_down(ec, mf, rows, k.stream);
+            }
+        } else {   // Q8_0 / other native expert formats (e.g. DQ8 packs' layers 20-23)
+            bk::native_quantize_q8_1(nrm, x.xq_[0], (int) E, rows, k.stream);
+            bk::native_expert_grouped(ec.L, x.ex_ptr_, x.ex_start_, x.ex_ng_, x.ex_dst_, x.ex_tok_,
+                                      std::min(ec.pairs, g_.n_expert), ec.pairs, x.xq_[0], x.ex_h_, x.ex_rows_, k.stream);
+            if (on_cpu) {
+                sh_->cpu->finish(l, rows, ids, x.ex_rows_, k.ex_tally + (size_t) l * g_.n_expert, k.stream);
+                fork_open_ = false;
+            }
             experts_finish(ec, mf, rows, k.stream);
-        } else {
-            experts_down(ec, mf, rows, k.stream);
         }
     }
 
