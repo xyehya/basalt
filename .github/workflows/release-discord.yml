@@ -1,10 +1,16 @@
 name: release-discord
 
 # A published release is announced in the Discord's #announcements through a channel webhook
-# (repository secret DISCORD_RELEASE_WEBHOOK). The announcement is a plain message: the release name, its link, the start of its notes cut at a whole line, and a link to the rest.
+# (repository secret DISCORD_RELEASE_WEBHOOK). The announcement is a plain message: the release name, its link, the start of its notes cut at a whole line, and a link to the rest. `workflow_dispatch` announces an existing release again.
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to announce again (v0.6.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -16,11 +22,18 @@ jobs:
       - name: Post to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
           NAME: ${{ github.event.release.name || github.event.release.tag_name }}
           URL: ${{ github.event.release.html_url }}
           BODY: ${{ github.event.release.body }}
         run: |
           if [ -z "$WEBHOOK" ]; then echo "::error::DISCORD_RELEASE_WEBHOOK is not set"; exit 1; fi
+          # A manual run announces an existing release: the workflow file of a release event is the one at its tag, so an older release needs this.
+          if [ -n "$TAG" ]; then
+            rel=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,url,body)
+            NAME=$(jq -r '.name // .tagName' <<<"$rel"); URL=$(jq -r .url <<<"$rel"); BODY=$(jq -r .body <<<"$rel")
+          fi
           # Plain text, not an embed: an embed quotes its description and clips it mid-word. The notes are cut at a whole line
           # (the title line is the name, so it is dropped), then a link to the rest; Discord's limit is 2000 characters.
           notes=$(printf '%s\n' "$BODY" | tr -d '\r' | awk -v max=1500 'NR == 1 && /^# / { next } n == 0 && $0 == "" { next } { if (n + length($0) + 1 > max) exit; print; n += length($0) + 1 }')
