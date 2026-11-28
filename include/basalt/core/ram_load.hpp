@@ -76,8 +76,8 @@ inline uint64_t pin_mapping_bytes(uint64_t pinned) { return pinned / 512; }
 
 /// Host memory an engine takes after its RAM tier has read the free RAM: the CUDA runtime's own host memory for the graphs it
 /// captures, the first request's buffers, the second card's context.  The tier's plan leaves it free beside the reserve; the
-/// serving RAM guard still holds the reserve alone, so the settled free RAM is above the guard and not on it.  0.2.1 left
-/// 2 GiB for it (kLateHostBytes); 0.3.1 removed that and a 64 GB box started at or below its guard (#339).
+/// serving RAM guard still holds the reserve alone, so the settled free RAM is above the guard and not on it.  Without it a
+/// box with little RAM would start at or below its guard.
 inline constexpr uint64_t kPostPlanHostBytes = 2ull << 30;
 
 /// The reserve a RAM tier is sized against: the free RAM the user asked for (`reserve`, the guard's line) and the
@@ -132,15 +132,19 @@ inline uint64_t file_cache_floor(uint64_t file_bytes, uint64_t want_bytes, const
 /// The RAM a tier sized by ram_tier_room(avail, reserve, pinned) also leaves free, toward `want_bytes` of experts: 0
 /// when they all fit, else the file cache's floor for the ones left in the file.  That share depends on the floor, so
 /// the iteration starts from all of them in the file and only goes down: the floor it ends on never undercounts.
+/// The keep is at most what the tier is short of: every byte of it moves an expert into the file, so a larger keep
+/// would leave more experts in the file to make room for the cache than RAM lacks, and fill that cache with them.
 inline uint64_t file_cache_keep(uint64_t avail, uint64_t reserve, bool pinned, uint64_t want_bytes, const FileCache& c) {
-    if (want_bytes <= ram_tier_room(avail, reserve, pinned)) return 0;
+    const uint64_t bare = ram_tier_room(avail, reserve, pinned);
+    if (want_bytes <= bare) return 0;
     uint64_t file = want_bytes, keep = 0;
     for (int i = 0; i < 16; ++i) {
         keep = file_cache_floor(file, want_bytes, c);
         const uint64_t room = ram_tier_room(avail, reserve + keep, pinned);
         file = want_bytes - (room < want_bytes ? room : want_bytes);
     }
-    return keep;
+    const uint64_t short_bytes = want_bytes - bare;
+    return keep < short_bytes ? keep : short_bytes;
 }
 
 /// Memory a pin takes whole large pages of: aligned to and padded to 2 MiB.

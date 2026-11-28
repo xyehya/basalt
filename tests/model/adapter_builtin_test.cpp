@@ -61,6 +61,16 @@ int main() {
 #else
     expect("inkling2", false);
 #endif
+#ifdef BASALT_MODEL_ERNIE55
+    expect("ernie55", true);
+#else
+    expect("ernie55", false);
+#endif
+#ifdef BASALT_MODEL_GEMMA4
+    expect("gemma4", true);
+#else
+    expect("gemma4", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         model::Started started;
@@ -117,6 +127,19 @@ int main() {
         int i = 1, code = 0;
         model::FlagArgs args((int) argv.size(), argv.data(), i);
         check(!d->parse_flag(argv[1], args, *o, code), "a dense model does not take the routing flags");
+    }
+    if (const model::ModelAdapter* e = model::find_adapter("ernie55")) {
+        const auto tf = e->tool_form();
+        check(tf.call_open == "<ernie:tool_call>\n" && tf.call_close == "\n</ernie:tool_call>" &&
+                  tf.fn_open == "<invoke name=\"" && tf.fn_mid == "\">" && tf.fn_close == "</invoke>" &&
+                  tf.param_open == "<parameter name=\"" && tf.param_mid_text == "\">" &&
+                  tf.param_mid_value == "\">" && tf.param_close == "</parameter>" &&
+                  tf.text_end == "</parameter>" && tf.calls_share_block && tf.trigger == "<ernie:tool_call>",
+              "ernie55 tool_form matches compact <invoke><parameter> wire format");
+        const auto rf = e->reply_form();
+        check(rf.think_open == "<ernie:think>" && rf.think_close == "</ernie:think>" &&
+                  rf.header.empty() && rf.answer_open.empty(),
+              "ernie55 reply_form uses <ernie:think> / </ernie:think>");
     }
     return failures ? 1 : 0;
 }

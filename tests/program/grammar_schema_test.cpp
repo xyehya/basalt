@@ -551,6 +551,48 @@ static void test_schema_regressions() {
         CHECK(num_frac && !ok(num_frac, "0") && ok(num_frac, "1") && ok(num_frac, "9") && !ok(num_frac, "10"));
         auto num_huge = build(R"({"allOf":[{"type":"integer"},{"type":"number","maximum":1e300}]})");
         CHECK(num_huge && ok(num_huge, "123456789"));
+        // bounds at the int64 limits: in-range values keep their exact bound
+        auto near_max = build(R"({"allOf":[{"type":"integer"},{"type":"number","minimum":9.21e18}]})");
+        CHECK(near_max && ok(near_max, "9210000000000000000") && !ok(near_max, "9209999999999999999"));
+        auto exmin_last = build(R"({"type":"integer","exclusiveMinimum":9223372036854775806})");
+        CHECK(exmin_last && ok(exmin_last, "9223372036854775807") && !ok(exmin_last, "9223372036854775806"));
+        auto exmax_last = build(R"({"type":"integer","exclusiveMaximum":-9223372036854775807})");
+        CHECK(exmax_last && ok(exmax_last, "-9223372036854775808") && !ok(exmax_last, "-9223372036854775807"));
+        // a bound past the int64 range on its open side is no limit: the same grammar as no bound at all
+        // (not an exclusive bound stepped off the int64 endpoint)
+        const std::string plain_int = json_schema_to_gbnf(R"({"type":"integer"})", err);
+        const std::string plain_all = json_schema_to_gbnf(R"({"allOf":[{"type":"integer"},{"type":"number"}]})", err);
+        CHECK(!plain_int.empty() && !plain_all.empty());
+        for (const char* open_side : {
+                 R"({"type":"integer","exclusiveMinimum":-9223372036854775809})",
+                 R"({"type":"integer","exclusiveMaximum":9223372036854775808})",
+                 R"({"type":"integer","exclusiveMinimum":-1e300})",
+                 R"({"type":"integer","exclusiveMaximum":1e300})"}) {
+            CHECK(json_schema_to_gbnf(open_side, err) == plain_int);
+        }
+        for (const char* open_side : {
+                 R"({"allOf":[{"type":"integer"},{"type":"number","exclusiveMinimum":-1e300}]})",
+                 R"({"allOf":[{"type":"integer"},{"type":"number","exclusiveMaximum":1e300}]})"}) {
+            CHECK(json_schema_to_gbnf(open_side, err) == plain_all);
+        }
+        // ...and on its closed side admits no int64, so the schema is rejected rather than admitting the endpoint
+        for (const char* none : {
+                 R"({"type":"integer","exclusiveMinimum":9223372036854775807})",
+                 R"({"type":"integer","exclusiveMaximum":-9223372036854775808})",
+                 R"({"type":"integer","minimum":9223372036854775808})",
+                 R"({"type":"integer","maximum":-9223372036854775809})",
+                 R"({"type":"integer","exclusiveMinimum":1e300})",
+                 R"({"type":"integer","maximum":-1e300})",
+                 R"({"allOf":[{"type":"integer"},{"type":"number","exclusiveMinimum":1e300}]})",
+                 R"({"allOf":[{"type":"integer"},{"type":"number","minimum":1e300}]})",
+                 R"({"allOf":[{"type":"integer"},{"type":"number","exclusiveMaximum":-1e300}]})",
+                 R"({"allOf":[{"type":"number","exclusiveMaximum":-9.223372036854775808e18},{"type":"integer"}]})"}) {
+            err.clear();
+            CHECK(json_schema_to_gbnf(none, err).empty() && !err.empty());
+        }
+        // a number schema keeps ignoring its bounds: it has non-int64 values past them
+        auto num_past = build(R"({"type":"number","exclusiveMinimum":1e300})");
+        CHECK(num_past && ok(num_past, "1e301"));
     }
 
     // R2C-1: number_text overflow, ULLONG_MAX, and malformed JSON numbers
@@ -665,6 +707,43 @@ static void test_schema_regressions() {
     }
 }
 
+static void test_ernie55_tool_form() {
+    ToolForm saved = tool_form();
+    ToolForm ef;
+    ef.call_open = "<ernie:tool_call>\n";
+    ef.call_close = "\n</ernie:tool_call>";
+    ef.fn_open = "<invoke name=\"";
+    ef.fn_mid = "\">";
+    ef.fn_close = "</invoke>";
+    ef.param_open = "<parameter name=\"";
+    ef.param_mid_text = "\">";
+    ef.param_mid_value = "\">";
+    ef.param_close = "</parameter>";
+    ef.text_end = "</parameter>";
+    ef.calls_share_block = true;
+    ef.trigger = "<ernie:tool_call>";
+    set_tool_form(ef);
+
+    std::string err;
+    const std::string tools = R"([
+        {"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}},
+        {"name":"ping","parameters":{"type":"object","properties":{}}}
+    ])";
+    auto g = Grammar::parse(tool_call_gbnf(tools, ToolGrammarOptions{}, err), err);
+    set_tool_form(saved);
+    CHECK(g && err.empty());
+    if (!g) return;
+
+    // Single call, multi-param call, zero-param call, and parallel calls in one shared block.
+    CHECK(call_ok(g, "<ernie:tool_call>\n<invoke name=\"bash\"><parameter name=\"command\">ls -la</parameter></invoke>\n</ernie:tool_call>"));
+    CHECK(call_ok(g, "<ernie:tool_call>\n<invoke name=\"bash\"><parameter name=\"command\">ls</parameter><parameter name=\"timeout\">30</parameter></invoke>\n</ernie:tool_call>"));
+    CHECK(call_ok(g, "<ernie:tool_call>\n<invoke name=\"ping\"></invoke>\n</ernie:tool_call>"));
+    CHECK(call_ok(g, "<ernie:tool_call>\n<invoke name=\"bash\"><parameter name=\"command\">pwd</parameter></invoke>\n<invoke name=\"ping\"></invoke>\n</ernie:tool_call>"));
+    // Reject spurious newlines after <invoke name="..."> or </parameter>.
+    CHECK(!pre(g, "<ernie:tool_call>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter></invoke>\n</ernie:tool_call>"));
+    CHECK(!pre(g, "<ernie:tool_call>\n<invoke name=\"bash\"><parameter name=\"command\">ls</parameter>\n</invoke>\n</ernie:tool_call>"));
+}
+
 int main() {
     set_test_tool_form();
     test_json_args();
@@ -675,6 +754,7 @@ int main() {
     test_array_nested();
     test_ref();
     test_tools();
+    test_ernie55_tool_form();
     test_text_unions();
     test_union_parameters();
     test_control_escapes();

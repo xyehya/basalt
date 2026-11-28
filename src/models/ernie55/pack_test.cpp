@@ -203,6 +203,26 @@ int main(int argc, char** argv) {
     const auto p_oom = ctxp::plan_context(1048576, 1048576, 2ull << 30, 37, 6, 128, 512, 512, 64, 128, ctxp::CacheFormat::Fp8);
     expect(!p_oom.error.empty(), "1M context exceeding half of 2 GiB free VRAM rejected");
 
+    const uint64_t sample_prompt = 800ull << 20;
+    const uint64_t sample_headroom = 160ull << 20;
+    const auto tr = ctxp::plan_tier_reserve(sample_prompt, sample_headroom);
+    expect(tr.copies == ctxp::kCopiesReserveBytes, "copies reserve unchanged for lendable VRAM tiers");
+    expect(tr.beside_homes == ctxp::kBesideHomesReserveBytes, "beside_homes reserve sized for module room");
+    expect(tr.modules == ctxp::kModuleRoomBytes, "modules reserve matches CUDA/MMQ module room");
+    expect(tr.homes == sample_prompt + sample_headroom + ctxp::kModuleRoomBytes,
+           "homes reserve covers prompt chunk + MMQ headroom + modules (ring defaults to 0)");
+
+    // The prefill expert ring rides into the homes budget only (never copies/beside_homes/modules); exact arithmetic.
+    const uint64_t sample_ring = 2ull * 128ull * (64ull << 20) + 256;   // 2 slots of 128 experts + the MMQ over-read tail
+    const auto trg = ctxp::plan_tier_reserve(sample_prompt, sample_headroom, sample_ring);
+    expect(trg.copies == ctxp::kCopiesReserveBytes, "home_ring_bytes leaves the copies reserve (16 GB cards) intact");
+    expect(trg.beside_homes == ctxp::kBesideHomesReserveBytes, "home_ring_bytes leaves beside_homes intact");
+    expect(trg.modules == ctxp::kModuleRoomBytes, "home_ring_bytes leaves the module room intact");
+    expect(trg.homes == sample_prompt + sample_ring + sample_headroom + ctxp::kModuleRoomBytes,
+           "homes reserve covers prompt chunk + expert ring + MMQ headroom + modules");
+    expect(ctxp::plan_tier_reserve(sample_prompt, sample_headroom, 0).homes == tr.homes,
+           "an explicit zero ring equals the defaulted call");
+
     // 2. f32_range_is_bf16 check
     {
         TempFile tf{make_temp_path("basalt_ernie55_bf16_check.bin")};

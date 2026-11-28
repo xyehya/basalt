@@ -158,13 +158,13 @@ int main() {
         CHECK(p.resident_bytes == in.ram_available - 9 * G);
         CHECK(p.resident_bytes > in.complement_full);
         in.ram_available = 28 * G;                  // it does not: the rest is read from the file, beside its cache
-        p = choose_auto(in);
-        CHECK(p.resident_bytes == 15 * G && p.resident_bytes < in.complement_full);
+        p = choose_auto(in);                        // 2.7 GiB short: the cache keeps that, not its 4 GiB minimum
+        CHECK(p.resident_bytes == 19 * G - (in.complement_full - 19 * G) && p.resident_bytes < in.complement_full);
         in.ram_available = 8 * G;                   // little RAM: no negative copy
         CHECK(choose_auto(in).resident_bytes == 0);
     }
     // The file cache's floor: a complement that does not fit leaves it free beside the floor for the experts read from
-    // the file (issue #285), and one that fits is not cut.
+    // the file, and one that fits is not cut.
     {
         AutoInputs in = base(64, false);            // 60 available, 6 floor, a 60 GiB complement
         in.file_cache = basalt::core::FileCache{G, 3 * G};

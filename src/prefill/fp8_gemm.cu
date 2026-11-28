@@ -6,7 +6,7 @@
 // (rows), each 64 tokens x 64 rows, ldmatrix fragments ping-ponged over the four k32 steps, one CTA per SM, the token
 // tiles fastest in the grid.  The activations are the mma's A (m16) and the weight rows its B (n8), so a thread's
 // accumulator pair is two adjacent weight rows of one token.  The mma is the block-scaled form with both scales 2^0 (the
-// plain e4m3 form accumulates at half rate on the RTX 5090); fp32 accumulation over K in order, the two scales applied
+// plain e4m3 form accumulates at half rate); fp32 accumulation over K in order, the two scales applied
 // with rounded multiplies once at the end, so a row's bits do not depend on the chunk length or the tile it falls in.
 // One product may span up to three weight matrices that share the activations (each with its own scale, output and
 // stride): their row tiles run in one grid.
@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -402,7 +403,8 @@ __global__ void __launch_bounds__(256) quantize_kernel(const In* __restrict__ x,
         float t = 0.0f;
         for (int i = 0; i < 8; ++i) t = fmaxf(t, red[i]);
         scale[blockIdx.x] = t / 448.0f;
-        inv_s = t > 0.0f ? 448.0f / t : 0.0f;
+        const float raw_inv = t > 0.0f ? 448.0f / t : 0.0f;
+        inv_s = isfinite(raw_inv) ? raw_inv : 0.0f;
     }
     __syncthreads();
     const float inv = inv_s;

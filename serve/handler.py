@@ -1125,9 +1125,13 @@ class Server(ThreadingHTTPServer):
 
     router: Router | None = None
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, server_address, request_handler_cls, *args, **kwargs):
+        # socketserver only knows AF_INET; an IPv6 literal needs the other family, or the
+        # bind fails with getaddrinfo and the port probe blames a port that is free
+        if ":" in server_address[0]:
+            self.address_family = socket.AF_INET6
         self.log_stop = threading.Event()
-        super().__init__(*args, **kwargs)
+        super().__init__(server_address, request_handler_cls, *args, **kwargs)
 
     def server_bind(self):
         if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):

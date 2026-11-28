@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
@@ -35,9 +36,19 @@ void quantize_q8_K_avx2(const float* x, void* dst, int64_t k) {
     for (int64_t i = 0; i < nb; ++i, x += QK_K) {
         __m256 v[QK_K / 8];
         __m256 am = _mm256_setzero_ps();
-        for (int j = 0; j < QK_K / 8; ++j) {
-            v[j] = _mm256_loadu_ps(x + 8 * j);
+        __m256 has_nan = _mm256_setzero_ps();
+        for (int j = 0; j < QK_K / 8; j += 2) {
+            v[j]     = _mm256_loadu_ps(x + 8 * j);
+            v[j + 1] = _mm256_loadu_ps(x + 8 * (j + 1));
             am = _mm256_max_ps(am, _mm256_and_ps(v[j], absmask));
+            am = _mm256_max_ps(am, _mm256_and_ps(v[j + 1], absmask));
+            has_nan = _mm256_or_ps(has_nan, _mm256_cmp_ps(v[j], v[j + 1], _CMP_UNORD_Q));
+        }
+        if (_mm256_movemask_ps(has_nan) != 0) {
+            y[i].d = std::numeric_limits<float>::quiet_NaN();
+            std::memset(y[i].qs, 0, QK_K);
+            std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
         }
         __m128 h = _mm_max_ps(_mm256_castps256_ps128(am), _mm256_extractf128_ps(am, 1));
         h = _mm_max_ps(h, _mm_movehl_ps(h, h));
@@ -89,6 +100,13 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     static const bool vnni = cpu_avxvnni_ok();
     if (vnni) iq256_rows_vnni(type, w, row_bytes, n, act, nt, out, r0, r1);
     else iq256_rows_base(type, w, row_bytes, n, act, nt, out, r0, r1);
+}
+
+void iq_exact_256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                       float* const* out, int r0, int r1) {
+    static const bool vnni = cpu_avxvnni_ok();
+    if (vnni) iq_exact_256_rows_vnni(type, w, row_bytes, n, act, nt, out, r0, r1);
+    else iq_exact_256_rows_base(type, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
 bool iq4nl256_fits(int n) noexcept { return n > 0 && n % QK4_NL == 0 && n / QK4_NL <= iq4nl_max_blocks; }

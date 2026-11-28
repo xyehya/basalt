@@ -133,7 +133,8 @@ class MaxTokens(unittest.TestCase):
                 self.assertIn("exceeds the context", b["error"]["message"])
                 self.assertIn("--fit-max-tokens", b["error"]["message"])     # says how to get past it
                 self.assertIn('"fit-max-tokens": true', b["error"]["message"])
-                self.assertIn('"server" section', b["error"]["message"])
+                self.assertIn('"engine" section', b["error"]["message"])     # it is a model setting, not the server's
+                self.assertNotIn('"server" section', b["error"]["message"])
                 self.assertNotIn(".json", b["error"]["message"])
                 self.assertRegex(b["error"]["message"], r"at most \d+ here")
 
@@ -2785,10 +2786,20 @@ class UsageAndStatus(unittest.TestCase):
         self.assertEqual(last["timings"]["cache_n"], ClockedEngine.REUSED)
 
     def test_anthropic(self):
-        u = self.chat("/v1/messages")["usage"]
+        b = self.chat("/v1/messages")
+        u, t = b["usage"], b["timings"]
         self.assertEqual(u["cache_read_input_tokens"], ClockedEngine.REUSED)
         self.assertEqual(u["input_tokens"] + u["cache_read_input_tokens"], len(self.engine.last_prompt))
         self.assertGreater(u["output_tokens"], 0)
+        self.assertEqual(t["cache_n"], ClockedEngine.REUSED)
+        self.assertEqual(t["prompt_n"] + t["cache_n"], u["input_tokens"] + u["cache_read_input_tokens"])
+        self.assertEqual(t["predicted_n"], u["output_tokens"])
+        self.assertAlmostEqual(t["predicted_per_second"], 50.0, delta=0.1)            # 20 ms a token
+
+    def test_anthropic_stream(self):
+        delta = next(e for e in self.chat("/v1/messages", stream=True) if e["type"] == "message_delta")
+        self.assertEqual(delta["usage"]["cache_read_input_tokens"], ClockedEngine.REUSED)
+        self.assertEqual(delta["timings"]["cache_n"], ClockedEngine.REUSED)
 
     def test_v1_status(self):
         self.chat("/v1/chat/completions")
@@ -3391,7 +3402,7 @@ class ThinkingBudget(unittest.TestCase):
         self.engine.generate = pt
 
     def test_thinking_budget_caps_the_thinking_not_the_reply_on_the_text_path(self):
-        # issue #512: the engine answers PT with the pass's cap (the budget); that must not become the total cap
+        # the engine answers PT with the pass's cap (the budget); that must not become the total cap
         self.engine.max_context = 16384
         self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40           # far longer than any budget below
         self._pt_engine()

@@ -1,6 +1,7 @@
 // tests/program/batch_plan_test.cpp - a round's windows over a batch's rows: each slot's rows of the cap by its drafts'
 // chances or max-min fair over its own window, and the first-fit groups that run as one batch (CPU).
 #include "program/serve/batch_plan.hpp"
+#include "program/serve/prompt_window.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -12,6 +13,46 @@ void check(bool ok, const char* what) {
     std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
     if (!ok) ++failures;
 }
+struct TestClock {
+    using duration = std::chrono::milliseconds;
+    using time_point = std::chrono::time_point<TestClock>;
+    inline static time_point time{};
+    static time_point now() { return time; }
+};
+
+void prompt_windows() {
+    using basalt::program::serve::prompt_window_queue;
+    struct Slot { bool active, stop; };
+    std::vector<Slot> slots = {{true, false}, {false, false}};
+    std::deque<std::string> commands = {"BSTOP 0", "BSTOP 1"};
+    check(!prompt_window_queue(commands, slots) && slots[0].stop && !slots[1].stop &&
+          commands == std::deque<std::string>{"BSTOP 1"}, "a stop for the slot being admitted stays queued");
+    slots[0].stop = false;
+    commands = {"BGEN 1 4 3,4", "BSTOP 0"};
+    check(!prompt_window_queue(commands, slots) && commands.size() == 2 && !slots[0].stop,
+          "a later stop cannot overtake an admission");
+    commands.pop_front();
+    check(prompt_window_queue(commands, slots) && commands.empty() && slots[0].stop,
+          "an active slot's stop reaches the batch round before its next window");
+
+    using basalt::program::serve::prompt_decode_windows;
+    using namespace std::chrono_literals;
+    int windows = 0;
+    const auto next = [&] { ++windows; TestClock::time += 2ms; return true; };
+    const auto ready = [] { return true; };
+    auto start = TestClock::now();
+    TestClock::time += 12ms;
+    check(prompt_decode_windows(start, ready, next) && windows == 3, "a twelve-ms chunk gives three two-ms windows");
+    start = TestClock::now();
+    check(prompt_decode_windows(start, ready, next) && windows == 4, "a short chunk still gives a ready slot one window");
+    check(prompt_decode_windows(start, [] { return false; }, next) && windows == 4, "no ready slot takes no window");
+    start = TestClock::now();
+    TestClock::time += 12ms;
+    check(prompt_decode_windows(start, [&] { return windows < 5; }, next) && windows == 5,
+          "a slot that stopped during the first window takes no more");
+    check(!prompt_decode_windows(start, ready, [] { return false; }), "a failed batch window ends the read");
+}
+
 using Groups = std::vector<std::vector<size_t>>;
 
 // every window in exactly one group, and no group over the cap
@@ -32,6 +73,7 @@ bool sound(const std::vector<int>& rows, const Groups& g, int cap) {
 }  // namespace
 
 int main() {
+    prompt_windows();
     using basalt::program::serve::batch_groups;
     using basalt::program::serve::batch_fair_shares;
     using basalt::program::serve::batch_shares;
@@ -54,6 +96,18 @@ int main() {
     }
     check(whole, "with no more slots than rows the shares add up to the cap, so one pass serves all");
     check(batch_shares(Joint(20), 16) == Rows(20, 16), "more slots than rows: each may take the cap");
+
+    using basalt::program::serve::batch_confident_shares;
+    check(batch_confident_shares({{0.9, 0.8, 0.7, 0.6, 0.5}, {0.4, 0.2, 0.1}}, 2, 16) == Rows{5, 3},
+          "drafts while all of them stay above half, at least two, at most four");
+    check(batch_confident_shares({{0.9, 0.8, 0.3}, {0.9, 0.8, 0.3}}, 8, 16) == Rows{4, 4},
+          "a quarter of the slots busy: the bar falls to an eighth");
+    check(batch_confident_shares({{0.9}, {}}, 2, 16) == Rows{2, 1}, "no more drafts than the slot has");
+    check(batch_confident_shares({{0.9, 0.8, 0.7, 0.6}, {0.9, 0.8, 0.65, 0.55}}, 2, 8) == Rows{4, 4},
+          "past the cap the least likely drafts beyond the first two come off first");
+    check(batch_confident_shares({{0.9, 0.8, 0.7}, {0.9, 0.8, 0.7}, {0.9, 0.8, 0.7}}, 3, 7) == Rows{3, 2, 2},
+          "then a row at a time from the slot with most, the later slot first");
+    check(batch_confident_shares(Joint(20), 20, 16) == Rows(20, 16), "more slots than rows: each may take the cap");
 
     check(batch_fair_shares({3}, 8) == Rows{3}, "one slot keeps its window");
     check(batch_fair_shares({3, 5}, 8) == Rows{3, 5}, "windows that fit together keep their rows");

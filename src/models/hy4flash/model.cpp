@@ -15,14 +15,18 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <iterator>
 #include <numeric>
+#include <string_view>
 
 namespace basalt::models::hy4flash {
 namespace {
 constexpr uint64_t kGiB = 1ull << 30;
+constexpr int kTypeF32 = 0;
 constexpr int kTypeQ8_0 = 8;
 constexpr int kTypeBF16 = 30;   // ggml's BF16
+constexpr std::string_view kRouterSuffix = "ffn_gate_inp.weight";
 // CPU uses of a missed expert that earn it a slot on the card
 constexpr int kAdmitUses = 2;
 // copies a decode window may claim per row (a window's rows route to mostly different experts)
@@ -32,13 +36,10 @@ constexpr int kClaimsPerRow = 128;
 // the counts, session.cpp)
 constexpr int kVictimHalfLife = 256;
 // The main card's copies by layer (core::ExpertTierSpec::layer_weights) for the 41 layers of 512 experts: the early layers
-// route more widely and miss far more often (layers 0-3 sent 2.3-2.9 experts a token to the CPU at 141 copies each,
-// layers 15, 27 and 31-33 under 0.6). From 768-token plain decode routing traces of one prose and one code prompt
-// (2026-11-19, Hy4-flash-NVFP4.basalt, RTX 5090 + RTX 5060 Ti, 141 copies a layer at the time): per layer, the misses an
-// LRU of each size leaves, priced at what that layer's CPU share took (93 us an expert, the MoE's GPU share 75 us), and
-// the copies given four at a time where they save the most. The table keeps half of that move (0.5 + 0.5 x copies over
-// their mean): the whole of it took struct's six-row windows of repeated keys down 2% on serve, half of it took them up
-// 4.6% and prose up 2.3% (bench.sh, none of its fixtures in the traces).
+// route more widely and miss far more often than layers 15, 27 and 31-33. Derived from plain decode routing traces of prose
+// and code prompts: per layer, the misses an LRU of each size leaves, priced at what that layer's CPU share costs against the
+// MoE's GPU share, and the copies given four at a time where they save the most. The table keeps half of that move
+// (0.5 + 0.5 x copies over their mean): the whole of it favours short windows of repeated keys less than the half does.
 constexpr float kLayerSlotWeights[41] = {1.380f, 1.420f, 1.410f, 1.310f, 1.195f, 1.155f, 1.080f, 1.195f, 1.065f, 1.195f, 1.295f,
                                          1.025f, 1.165f, 1.240f, 1.065f, 0.725f, 0.940f, 0.785f, 1.040f, 0.925f, 1.265f, 1.010f,
                                          0.910f, 0.800f, 0.995f, 0.925f, 0.840f, 0.725f, 0.770f, 0.925f, 0.870f, 0.725f, 0.725f,
@@ -71,6 +72,14 @@ const DevTensor* Hy4Model::tensor(const std::string& name) const {
 bool Hy4Model::embedding_row(int32_t token, float* out) const {
     const uint64_t n = (uint64_t) geo().n_embd;
     if (token < 0 || (int64_t) token >= geo().n_vocab) return false;
+    if (embd_type_ == kTypeBF16) {
+        const uint16_t* row = reinterpret_cast<const uint16_t*>(embd_.data()) + (uint64_t) token * n;
+        for (uint64_t i = 0; i < n; ++i) {
+            const uint32_t u = (uint32_t) row[i] << 16;
+            std::memcpy(out + i, &u, 4);
+        }
+        return true;
+    }
     const uint8_t* row = embd_.data() + (uint64_t) token * (n / 32) * 34;
     for (uint64_t b = 0; b < n / 32; ++b) dequantize_q8_0(row + b * 34, out + b * 32);
     return true;
@@ -114,12 +123,16 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.share_max_tokens = 16384;
     s.share_stride = expert_stride();
     s.lend_segment = kExpertLendSegment;
+    s.host.bytes = [this] { return engram_ ? engram_->ram_bytes() : 0; };
+    s.host_cache_keep = engram_ ? engram_->ram_bytes() : 0;
     return s;
 }
 
 model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& reads,
                              std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
     if (req.paths.empty()) return {model::Status::Error, "hy4flash: no model path"};
+    if (!req.ple_io.empty() && req.ple_io != "direct" && req.ple_io != "ram")
+        return {model::Status::Error, "hy4flash: --ple-io " + req.ple_io + ": direct or ram"};
     std::string err;
     const std::string& path = req.paths.front();
     if (!open_pack(path, pack_, err)) return {model::Status::Error, "hy4flash: " + err};
@@ -148,9 +161,10 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     uint64_t dense = 0;
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight") {
-            if (t.type != kTypeQ8_0 || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd) {
-                return {model::Status::Error, "hy4flash: token_embd.weight is not Q8_0 [n_embd][vocab]"};
+            if ((t.type != kTypeQ8_0 && t.type != kTypeBF16) || t.shape.size() != 2 || t.shape[0] != (uint64_t) g.n_embd) {
+                return {model::Status::Error, "hy4flash: token_embd.weight is not Q8_0 or BF16 [n_embd][vocab]"};
             }
+            embd_type_ = t.type;
             embd_.resize(t.bytes);
             core::LoadItem it;
             it.file = file;
@@ -173,6 +187,14 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
             d.type = kTypeQ8_0;
             d.bytes = t.shape[0] * t.shape[1] / 32 * 34;
         }
+        // The router's weights are BF16 in the checkpoint and F32 in the pack (low 16 bits are zero): load as BF16
+        // (exact bit-for-bit logits, 123 MiB VRAM saved -> ~32 more expert slots on GPU 0, half router traffic).
+        const bool router_bf16 = t.type == kTypeF32 && name.size() > kRouterSuffix.size() &&
+                                 name.compare(name.size() - kRouterSuffix.size(), kRouterSuffix.size(), kRouterSuffix) == 0;
+        if (router_bf16) {
+            d.type = kTypeBF16;
+            d.bytes = t.bytes / 2;
+        }
         // the prompt products (MMQ) read the last row of a matrix whose rows are not a multiple of 256 values on to the next
         // multiple: zeros past the end, so the read stays inside the allocation wherever it lies
         const uint64_t past = !t.shape.empty() && prefill::mmq::supported(d.type) ? prefill::mmq::read_past_bytes(d.type, (int64_t) t.shape[0]) : 0;
@@ -185,6 +207,7 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
         it.dev = d.ptr;
         it.device = device_;
         if (head_q8) it.conv = core::Conv::Bf16ToQ8_0;
+        if (router_bf16) it.conv = core::Conv::Bf16High;
         reads.add(it);
         dense += d.bytes;
         dev_.emplace(name, std::move(d));
@@ -220,8 +243,14 @@ model::Result Hy4Model::plan(const model::LoadRequest& req, core::LoadPlan& read
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes))
+        // Map now so tier_spec() reserves its RAM; lock/touch in attach() after the expert tier's reads finish so
+        // buffered expert reads cannot evict unlocked Engram pages from the OS page cache.
+        if (req.ple_io == "ram") {
+            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/false))
+                return {model::Status::Error, "hy4flash: " + err};
+        } else if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes)) {
             return {model::Status::Error, "hy4flash: " + err};
+        }
     }
     // the sessions first, then the expert tier, sized from what they leave and opened by the first session; its reads are
     // queued in the start's plan
@@ -246,6 +275,14 @@ model::Result Hy4Model::attach(const model::LoadRequest&, std::vector<std::uniqu
     if (dfly_) {   // the drafts' head screen, made from the head the reads placed
         cudaSetDevice(device_);
         if (!dfly_->pack_screen(nullptr, err)) return {model::Status::Error, "hy4flash: " + err};
+    }
+    if (engram_ && engram_->ram_bytes() > 0) {
+        const auto t0 = std::chrono::steady_clock::now();
+        engram_->lock_ram();
+        basalt::log::info("basalt hy4flash", "Engram table %.2f GiB %s (--ple-io ram) in %.1f s",
+                          (double) engram_->ram_bytes() / (double) kGiB,
+                          engram_->locked() ? "locked in RAM" : "loaded (not locked)",
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     return {};
 }
