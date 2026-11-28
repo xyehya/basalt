@@ -118,7 +118,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring of file reads
     // comes only when experts may stay in the file.
     platform::HostMemory hm;
-    auto available = [&] { return platform::host_available_memory(hm) ? hm.available : 0; };
+    auto available = [&] {
+        const uint64_t a = platform::host_available_memory(hm) ? hm.available : 0;
+        return a > s_.host_cache_keep ? a - s_.host_cache_keep : 0;
+    };
     const uint64_t ram_reserve = platform::ram_reserve();
     uint64_t tier_reserve = ram_reserve;   // and the file cache's floor once experts stay in the file
     // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
@@ -142,7 +145,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     // what the machine can give the tier whatever else runs: its RAM (or the container's) less the engine's own buffers.
     // The home-versus-copies choice reads this alone, so the cache state at start never moves it.
     const uint64_t total = std::min(platform::total_physical_memory(), hm.cgroup_limit);
-    const int ram_cap = ram_given ? -1 : (int) std::min<uint64_t>(places_in(total > host_bytes_ ? total - host_bytes_ : 0), 1u << 20);
+    // (a model that keeps its homes reads it as no room: plan_homes then homes all the card holds)
+    const int ram_cap = ram_given ? -1 : s_.keep_homes ? 0 : (int) std::min<uint64_t>(places_in(total > host_bytes_ ? total - host_bytes_ : 0), 1u << 20);
     homes_ = core::policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     if (homes_.file > 0) {   // experts stay in the file: the ring of its reads takes RAM before the tier is sized
         if (s_.host.set_ring && !s_.host.set_ring(s_.ring_pieces, err)) return false;
@@ -214,6 +218,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
             return false;
         f.gate_softcap = el.gate_softcap;
         f.up_softcap = el.up_softcap;
+        f.gelu = el.gelu;
         fmt_.push_back(f);
     }
     act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);

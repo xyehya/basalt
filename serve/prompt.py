@@ -25,8 +25,8 @@ def overflow_error(n: int, max_new: int, ctx: int) -> ValueError:
                       f"prompt ({n} tokens) + max tokens ({max_new}) exceeds the context "
                       f"({ctx}); requests are never truncated. Send a smaller "
                       f"max_tokens (at most {max(0, room)} here), or start the server with "
-                      "--fit-max-tokens (or set \"fit-max-tokens\": true in the \"server\" section of "
-                      "the --config file) to shorten it to the room left")
+                      "--fit-max-tokens (or set \"fit-max-tokens\": true in the \"engine\" section or a "
+                      "model entry of the --config file) to shorten it to the room left")
 
 
 class PromptText:

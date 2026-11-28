@@ -1,4 +1,5 @@
 // src/program/grammar/json_schema.cpp - JSON schema -> SchemaNode tree. See schema_internal.hpp.
+#include <cerrno>
 #include <climits>
 #include <cmath>
 #include <stdexcept>
@@ -44,16 +45,50 @@ class Builder {
         return (int) value->as_int();
     }
 
-    // a fractional bound is rounded inwards, towards the integers it still admits
-    static int64_t get_bound(const JsonValue& schema, const std::string& key, const std::string& path, bool round_up) {
+    enum class Side { Below, Inside, Above };
+
+    // a bound as an integer (a fractional one rounded up or down) and where it lies against the int64 range
+    static Side read_bound(const JsonValue& schema, const std::string& key, const std::string& path, bool round_up, int64_t& out) {
         const JsonValue& value = *schema.get(key);
-        if (value.is_integer()) return value.as_int();
         if (value.type != Type::Number) fail(path, key + " must be a number");
-        double d = round_up ? std::ceil(value.as_double()) : std::floor(value.as_double());
-        // out-of-range doubles saturate: a cast would be undefined
-        if (!(d > -9.2e18)) return INT64_MIN;
-        if (!(d < 9.2e18)) return INT64_MAX;
-        return (int64_t) d;
+        if (value.is_integer()) {
+            errno = 0;
+            const long long v = std::strtoll(value.s.c_str(), nullptr, 10);
+            if (errno == ERANGE) return value.s[0] == '-' ? Side::Below : Side::Above;
+            out = v;
+            return Side::Inside;
+        }
+        const double d = round_up ? std::ceil(value.as_double()) : std::floor(value.as_double());
+        // out-of-range doubles are placed, never cast: a cast would be undefined
+        if (!(d >= -0x1p63)) return Side::Below;
+        if (!(d < 0x1p63)) return Side::Above;
+        out = (int64_t) d;
+        return Side::Inside;
+    }
+
+    // the smallest int64 a lower bound admits: INT64_MIN when it admits all of them, `none` when it admits none
+    static int64_t lower_limit(const JsonValue& schema, const std::string& key, const std::string& path, bool exclusive, bool& none) {
+        int64_t v = INT64_MIN;
+        // inclusive: the next integer up; exclusive: the integer at or below the bound, then one past it
+        const Side side = read_bound(schema, key, path, /* round_up */ !exclusive, v);
+        if (side == Side::Below) return INT64_MIN;
+        if (side == Side::Above || (exclusive && v == INT64_MAX)) {
+            none = true;
+            return INT64_MAX;
+        }
+        return exclusive ? v + 1 : v;
+    }
+
+    // the largest int64 an upper bound admits: INT64_MAX when it admits all of them, `none` when it admits none
+    static int64_t upper_limit(const JsonValue& schema, const std::string& key, const std::string& path, bool exclusive, bool& none) {
+        int64_t v = INT64_MAX;
+        const Side side = read_bound(schema, key, path, /* round_up */ exclusive, v);
+        if (side == Side::Above) return INT64_MAX;
+        if (side == Side::Below || (exclusive && v == INT64_MIN)) {
+            none = true;
+            return INT64_MIN;
+        }
+        return exclusive ? v - 1 : v;
     }
 
     static SchemaNode::Format get_format(const JsonValue& schema, const std::string& path) {
@@ -241,14 +276,14 @@ class Builder {
         auto node = std::make_unique<SchemaNode>();
         node->kind = SchemaNode::Integer;
         if (schema.contains("minimum")) {
-            node->minimum = get_bound(schema, "minimum", path, /* round_up */ true);
+            node->minimum = lower_limit(schema, "minimum", path, /* exclusive */ false, node->no_integer);
         } else if (schema.contains("exclusiveMinimum")) {
-            node->minimum = get_bound(schema, "exclusiveMinimum", path, /* round_up */ false) + 1;
+            node->minimum = lower_limit(schema, "exclusiveMinimum", path, /* exclusive */ true, node->no_integer);
         }
         if (schema.contains("maximum")) {
-            node->maximum = get_bound(schema, "maximum", path, /* round_up */ false);
+            node->maximum = upper_limit(schema, "maximum", path, /* exclusive */ false, node->no_integer);
         } else if (schema.contains("exclusiveMaximum")) {
-            node->maximum = get_bound(schema, "exclusiveMaximum", path, /* round_up */ true) - 1;
+            node->maximum = upper_limit(schema, "exclusiveMaximum", path, /* exclusive */ true, node->no_integer);
         }
         return node;
     }

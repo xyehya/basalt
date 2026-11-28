@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace basalt::kernels::cpu {
 namespace {
@@ -226,8 +227,8 @@ inline void iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accum[t]) + IQ1S_DELTA * accum1[t];
 }
 
-// ---- IQ2_XXS, IQ2_XS, NT tokens: integer sums folded to ggml's eight int32 lanes, its float accumulation order per
-// token, so every token's result is bit for bit ggml's single-token dot.
+// ---- IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, NT tokens: integer sums folded to ggml's eight int32 lanes, its float
+// accumulation order per token, so every token's result is bit for bit ggml's single-token dot.
 template <int TY, int NT>
 inline void row_dot_exact(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
     __m256 accum[NT];
@@ -306,7 +307,7 @@ inline void iq1m_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accum1[t]) + IQ1M_DELTA * hsum8(accum2[t]);
 }
 
-// the exact dots of one row for NT tokens: IQ1_S, IQ2_XXS, IQ2_XS, IQ1_M
+// the exact dots of one row for NT tokens: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S
 template <int TY, int NT>
 inline void exact_dot(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
     if constexpr (TY == 19) iq1s_row_dot<NT>(row, nb, y, res);
@@ -367,13 +368,18 @@ void exact_rows_k(int k, const uint8_t* w, size_t row_bytes, int nb, const void*
         case 1: exact_rows<TY, 1>(w, row_bytes, nb, act, out, r0, r1); break;
         case 2: exact_rows<TY, 2>(w, row_bytes, nb, act, out, r0, r1); break;
         case 3: exact_rows<TY, 3>(w, row_bytes, nb, act, out, r0, r1); break;
-        default: exact_rows<TY, 4>(w, row_bytes, nb, act, out, r0, r1); break;
+        case 4: exact_rows<TY, 4>(w, row_bytes, nb, act, out, r0, r1); break;
+        case 5: exact_rows<TY, 5>(w, row_bytes, nb, act, out, r0, r1); break;
+        case 6: exact_rows<TY, 6>(w, row_bytes, nb, act, out, r0, r1); break;
+        case 7: exact_rows<TY, 7>(w, row_bytes, nb, act, out, r0, r1); break;
+        default: exact_rows<TY, 8>(w, row_bytes, nb, act, out, r0, r1); break;
     }
 }
 
 // tokens in groups of up to four
 void exact_gu_rows_nt(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, bool scaled,
                       float limit, const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    if (nt <= 0 || r0 >= r1) return;
     const int nb = n / QK_K;
     for (int t0 = 0; t0 < nt; t0 += 4) {
         const int k = nt - t0 < 4 ? nt - t0 : 4;
@@ -381,6 +387,9 @@ void exact_gu_rows_nt(int type, const uint8_t* blob, size_t gu_row, size_t up_of
         case 19: exact_gu_rows_k<19>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 16: exact_gu_rows_k<16>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 17: exact_gu_rows_k<17>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
+        case 18: exact_gu_rows_k<18>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
+        case 21: exact_gu_rows_k<21>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
+        case 22: exact_gu_rows_k<22>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 29: exact_gu_rows_k<29>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         default: break;
         }
@@ -389,13 +398,18 @@ void exact_gu_rows_nt(int type, const uint8_t* blob, size_t gu_row, size_t up_of
 
 void exact_rows_nt(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                    int r0, int r1) {
+    if (nt <= 0 || r0 >= r1) return;
     const int nb = n / QK_K;
-    for (int t0 = 0; t0 < nt; t0 += 4) {
-        const int k = nt - t0 < 4 ? nt - t0 : 4;
+    const int step = (type == 19 || type == 29) ? 4 : 8;   // IQ1_S and IQ1_M keep two accumulators per token
+    for (int t0 = 0; t0 < nt; t0 += step) {
+        const int k = nt - t0 < step ? nt - t0 : step;
         switch (type) {
         case 19: exact_rows_k<19>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 16: exact_rows_k<16>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 17: exact_rows_k<17>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
+        case 18: exact_rows_k<18>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
+        case 21: exact_rows_k<21>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
+        case 22: exact_rows_k<22>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 29: exact_rows_k<29>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         default: break;
         }
@@ -463,29 +477,33 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
 template <int TY>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
-    switch (nt) {
-        case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+    for (int t0 = 0; t0 < nt; t0 += 8) {
+        const int k = nt - t0 < 8 ? nt - t0 : 8;
+        switch (k) {
+            case 1: gu_rows<TY, 1>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 2: gu_rows<TY, 2>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 3: gu_rows<TY, 3>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 4: gu_rows<TY, 4>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 5: gu_rows<TY, 5>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 6: gu_rows<TY, 6>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 7: gu_rows<TY, 7>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            case 8: gu_rows<TY, 8>(blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1); break;
+            default: break;
+        }
     }
 }
 
 template <int TY>
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
-    switch (nt) {
-        case 1: dot_rows<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        switch (k) {
+            case 1: dot_rows<TY, 1>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 2: dot_rows<TY, 2>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 3: dot_rows<TY, 3>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            case 4: dot_rows<TY, 4>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            default: break;
         }
     }
 }
@@ -499,9 +517,19 @@ void quantize_q8_K_avx512(const float* x, void* dst, int64_t k) {
     for (int64_t i = 0; i < nb; ++i, x += QK_K) {
         __m512 v[QK_K / 16];
         __m512 am = _mm512_setzero_ps();
-        for (int j = 0; j < QK_K / 16; ++j) {
-            v[j] = _mm512_loadu_ps(x + 16 * j);
+        unsigned has_nan = 0;
+        for (int j = 0; j < QK_K / 16; j += 2) {
+            v[j]     = _mm512_loadu_ps(x + 16 * j);
+            v[j + 1] = _mm512_loadu_ps(x + 16 * (j + 1));
             am = _mm512_max_ps(am, _mm512_abs_ps(v[j]));
+            am = _mm512_max_ps(am, _mm512_abs_ps(v[j + 1]));
+            has_nan |= (unsigned) _mm512_cmp_ps_mask(v[j], v[j + 1], _CMP_UNORD_Q);
+        }
+        if (has_nan != 0) {
+            y[i].d = std::numeric_limits<float>::quiet_NaN();
+            std::memset(y[i].qs, 0, QK_K);
+            std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
         }
         const float amax = _mm512_reduce_max_ps(am);
         if (amax == 0.f) {
@@ -568,7 +596,9 @@ void iq1s_512_rows(const uint8_t* w, size_t row_bytes, int n, const void* const*
     exact_rows_nt(19, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
-bool iq_exact_512_supported(int type) noexcept { return type == 16 || type == 17 || type == 29; }
+bool iq_exact_512_supported(int type) noexcept {
+    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29;
+}
 
 void iq_exact_512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su,
                           bool scaled, float limit, const void* const* act, int nt, float* const* ff, int r0, int r1) {

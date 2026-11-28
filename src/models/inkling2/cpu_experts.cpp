@@ -28,7 +28,7 @@
 namespace basalt::models::inkling2 {
 namespace cpu = kernels::cpu;
 
-static_assert(kBatchRows * 8 <= 1024, "a batch visit's RAM pairs fit one call");
+static_assert(kBatchRows * 8 <= kMaxPairs, "a batch visit's RAM pairs fit one call");
 
 namespace {
 // The doorbell's thread spins this long after its last visit or wake, then naps a step at a time until the next.
@@ -237,7 +237,7 @@ CpuExperts::~CpuExperts() = default;
 std::unique_ptr<CpuExperts> CpuExperts::make(const InklingModel& m, std::string& err) {
     if (!m.spill().any()) return nullptr;
     const Geometry& g = m.geo();
-    if (g.n_embd != kWidth || g.n_layers > 64 || g.n_used * kBatchRows > 1024) {
+    if (g.n_embd != kWidth || g.n_layers > 64 || g.n_used * kBatchRows > kMaxPairs) {
         err = "the CPU experts do not fit this geometry";
         return nullptr;
     }
@@ -309,15 +309,16 @@ void CpuExperts::rows(int l, int rows, const float* input, cudaStream_t stream) 
 
 void CpuExperts::start(int l, int rows, const int32_t* ids, cudaStream_t stream) {
     Impl& p = *impl_;
-    must(cudaEventRecord(p.ready, stream), "fork");
-    must(cudaStreamWaitEvent(p.stream, p.ready, 0), "fork wait");
-    moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, l, p.ids_dev, p.bell_dev, p.seq, p.stream);
+    // the ring runs on the visit's stream, after the rows' publication and before the card's experts: those fill every
+    // SM, so a ring beside them would wait for their last blocks and the CPU would start late
     must(cudaEventRecord(p.done, p.stream), "join");
+    must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");
+    moe_cpu_ring(ids, rows, p.k, p.model->layer(l).blob_table, l, p.ids_dev, p.bell_dev, p.seq, stream);
 }
 
 void CpuExperts::finish(int l, int rows, const int32_t* ids, float* out, uint32_t* tally, cudaStream_t stream) {
     Impl& p = *impl_;
-    must(cudaStreamWaitEvent(stream, p.done, 0), "join wait");   // the ring has advanced `seq` before the merge reads it
+    // the ring ran on this stream (start), so it has advanced `seq` before the merge reads it
     moe_cpu_merge(ids, rows, p.k, p.model->layer(l).blob_table, p.out_dev, out, tally, stream, p.bell_dev, p.seq);
 }
 

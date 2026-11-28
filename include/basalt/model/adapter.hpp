@@ -28,6 +28,7 @@ class GgufFile;
 }
 namespace basalt::core {
 struct ConversationKv;
+struct Json;
 class LoadPlan;
 }
 namespace basalt::program {
@@ -104,9 +105,11 @@ struct LoadRequest {
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
+    std::string ple_io = "direct";    ///< --ple-io: n-gram table read mode ("direct" or "ram")
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
     RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
+    bool kv_pool = true;              ///< --kv-pool: a model with a KV pool backs every session's cells from it (false: each its own, fixed)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
 };
 
@@ -152,6 +155,8 @@ public:
     virtual ~ModelSession() = default;
     virtual Result decode_window(const DecodeRequest& r) = 0;
     virtual Result prefill_chunk(const PrefillRequest& r) = 0;
+    /// A synchronized text chunk after which other sessions can decode; 0 keeps the whole read exclusive.
+    virtual int prefill_window_rows() const { return 0; }
     /// The rows a decode_batch call holds in all; 0: this model's sessions do not batch their windows.
     virtual int batch_rows() const { return 0; }
     /// The windows reqs[0..n) of the distinct sessions[0..n) (sessions of one model, this one among them) as one batch, the
@@ -180,6 +185,9 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// The rows a teacher-forced verify window (ppl= / score=) may hold, including all rows copy_logits() can read;
+    /// defaults to max_window().
+    virtual int max_verify_window() const { return max_window(); }
     /// True when the last decode_window ran uncaptured or instantiated a new CUDA graph.
     virtual bool window_cold() const { return false; }
     virtual int prompt_fold_window() const { return 1; }
@@ -251,6 +259,9 @@ public:
     /// read from the file.
     struct ExpertCounts { int64_t hits = 0, lookups = 0, offloaded = 0, files = 0; };
     virtual ExpertCounts expert_counts() const { return {}; }
+    /// Start the expert accounting over.  The hit rate the server reports is per request; a cumulative tally read against
+    /// a per-request denominator reads over 100% once promotion has moved experts between VRAM and RAM mid-session.
+    virtual void reset_expert_counts() {}
     /// The experts each GPU holds now (CUDA ordinal, slots, their VRAM bytes); empty without routed experts.
     struct CardExperts { int device = 0; int64_t slots = 0; uint64_t bytes = 0; };
     virtual std::vector<CardExperts> experts_by_card() const { return {}; }
@@ -264,6 +275,14 @@ public:
     }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
+    /// The shared KV pool (core/kv_pool.hpp): a session that backs its per-position cells from one pool as its conversation
+    /// grows reaches the whole context while the pool has room. Backs the cells of `positions` positions: Refused, with
+    /// nothing changed, when the pool is short. A session whose caches are its own, sized at start, has them already.
+    virtual Result kv_back(int64_t positions) { (void) positions; return {}; }
+    /// Gives the pool back the cells past `positions` (0: the conversation left the card).
+    virtual void kv_trim(int64_t positions) { (void) positions; }
+    /// The pool's figures for the log, empty without a pool: its bytes, what is free and what this session backs.
+    virtual std::string kv_pool_line() const { return {}; }
     /// An elastic KV's ceiling (core/elastic_kv.hpp): the positions the session can back before the expert cache would go below
     /// the slots a prompt chunk needs; -1 without an elastic KV.
     virtual int64_t kv_ceiling() { return -1; }
@@ -366,14 +385,25 @@ public:
     virtual int planned_spec(const program::CommonOptions& o) const;
     /// The flags the quality gate starts this model with, space separated.
     virtual const char* quality_flags() const { return ""; }
-    /// The model's name as a community benchmark row records it; empty for a model that has none.
-    virtual const char* model_name() const { return ""; }
+    /// The model's name as a community benchmark row records it, for the pack whose metadata is `gguf_kv`; empty for a
+    /// model that has none.
+    virtual const char* model_name(const core::Json& gguf_kv) const {
+        (void) gguf_kv;
+        return "";
+    }
     /// The KV cache format a community benchmark row runs this model with when it takes no int8; empty: its default.
     virtual const char* community_kv() const { return ""; }
-    /// The quant label of a community row when the pack's name carries none (its name ends in no format word); empty: "unknown".
-    virtual const char* community_quant() const { return ""; }
+    /// The quant label of a community row when the pack's name carries none (its name ends in no format word), for the
+    /// pack whose metadata is `meta`; empty: "unknown".
+    virtual const char* community_quant(const core::Json& meta) const {
+        (void) meta;
+        return "";
+    }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
+    /// The most parallel slots (--batch) the model batches: each slot's window takes at least one row of a batch window. A
+    /// start asking for more is refused.
+    virtual int max_slots() const = 0;
     /// What the model runs with several cards: the most cards each mode takes, 0 for a mode it does not run.
     virtual program::GpuModes gpu_modes() const = 0;
     virtual TokenNames token_names() const = 0;
@@ -384,6 +414,8 @@ public:
         const char* name = "";
         void (*split)(const char* text, size_t size, std::vector<size_t>& ends) = nullptr;
         bool ignore_merges = false;
+        /// SentencePiece's BPE with byte fallback (program::Tokenizer::set_sentencepiece).
+        bool sentencepiece = false;
     };
     virtual PreTokenizer pretokenizer() const = 0;
     virtual program::grammar::ToolForm tool_form() const = 0;

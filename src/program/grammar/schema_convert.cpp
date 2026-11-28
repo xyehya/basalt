@@ -1146,6 +1146,7 @@ struct SchemaConverter::Impl {
             for (const SchemaNode* b : other_branches) {
                 if (b->minimum > merged.minimum) merged.minimum = b->minimum;
                 if (b->maximum < merged.maximum) merged.maximum = b->maximum;
+                merged.no_integer = merged.no_integer || b->no_integer;
             }
             return visit(merged, name);
         }
@@ -1276,6 +1277,10 @@ struct SchemaConverter::Impl {
                 return visit_primitive(rule_name, "string");
             }
             case SchemaNode::Integer: {
+                if (schema.no_integer) {
+                    errors.push_back("no int64 value satisfies the bounds");
+                    return "";
+                }
                 if (schema.minimum == (std::numeric_limits<int64_t>::min)() && schema.maximum == (std::numeric_limits<int64_t>::max)()) {
                     return visit_primitive(rule_name, "integer");
                 }

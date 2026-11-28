@@ -21,7 +21,8 @@ namespace basalt::program::cli {
 namespace {
 
 // The architecture named in the file --model gives; empty without one. An exit code when it cannot be used.
-std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*& adapter) {
+std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*& adapter, std::string& model_name,
+                              std::string& community_quant) {
     std::string path;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -43,6 +44,8 @@ std::optional<int> find_model(int argc, char** argv, const model::ModelAdapter*&
         basalt::log::error("basalt", "--model: %s", model::unavailable_architecture(name).c_str());
         return 2;
     }
+    model_name = adapter->model_name(*kv);
+    community_quant = adapter->community_quant(file.meta());
     return std::nullopt;
 }
 
@@ -89,6 +92,10 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+        std::printf("v%s\n", BASALT_VERSION);
+        return 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
     basalt::platform::install_crash_handler();
     // if memory runs out the kernel ends this process first, not the rest of the machine
@@ -101,14 +108,15 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     // later (`kLazyKernelsMib`).  CUDA_MODULE_LOADING=EAGER restores the up-front load; batched serving sets it (below).
     const bool module_loading_set = std::getenv("CUDA_MODULE_LOADING") != nullptr;
     if (!module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "LAZY");
-    if (const auto code = find_model(argc, argv, adapter)) return *code;
+    std::string model_name, community_quant;
+    if (const auto code = find_model(argc, argv, adapter, model_name, community_quant)) return *code;
     out = adapter != nullptr ? adapter->make_options() : std::make_unique<CommonOptions>();
     CommonOptions& o = *out;
     if (adapter != nullptr) {
         o.arch = adapter->arch();
-        o.model_name = adapter->model_name();
+        o.model_name = model_name;
         o.community_kv = adapter->community_kv();
-        o.community_quant = adapter->community_quant();
+        o.community_quant = community_quant;
         o.quality_flags = adapter->quality_flags();
         o.quality_window = adapter->quality_window();
     }

@@ -495,7 +495,8 @@ bool FileExpertSource::pin_cache_complement(
 bool FileExpertSource::plan_cache_complement(
     LoadPlan& load_plan, const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+    bool allow_empty) {
     err.clear();
     headroom_bytes = std::max(headroom_bytes, platform::ram_reserve());   // never lock into the reserve
     const auto pin_t0 = std::chrono::steady_clock::now();
@@ -588,7 +589,7 @@ bool FileExpertSource::plan_cache_complement(
     if (lend_room > 0) {
         // the budget holds every expert of the complement and the free places for the adaptive swaps: none is left to
         // the files, and the prompt path's lend region is kept in what the budget has left (a budget that holds the
-        // experts but not the free places keeps them as before: the swaps would lose their places, #342, #366)
+        // experts but not the free places keeps them as before: the swaps would lose their places)
         basalt::log::info("basalt", "FileExpertSource: RAM budget %.2f GiB holds the %.2f GiB of experts the GPU cache does "
                              "not hold; the prompt path's lend region takes the rest of it",
                      (double) budget_bytes / 1073741824.0, (double) bytes / 1073741824.0);
@@ -614,9 +615,12 @@ bool FileExpertSource::plan_cache_complement(
                 at += b;
                 ++held;
             }
-        if (what_fits && held == 0) {   // nothing to keep - the caller's plain mmap fallback, not an empty copy
-            err = "FileExpertSource: the RAM has no room for any expert of the complement";
-            return false;
+        if (what_fits && held == 0) {
+            if (!allow_empty) {   // nothing to keep - the caller's plain mmap fallback, not an empty copy
+                err = "FileExpertSource: the RAM has no room for any expert of the complement";
+                return false;
+            }
+            basalt::log::info("basalt", "FileExpertSource: the complement starts empty for a later top-up");
         }
         basalt::log::info("basalt", "FileExpertSource: RAM budget %.2f GiB: %lld of the %.2f GiB of experts the GPU cache does "
                              "not hold, by profile rank; the rest are read from the files",

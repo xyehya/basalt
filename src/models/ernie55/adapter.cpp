@@ -34,27 +34,35 @@ public:
         return {key + ".prof"};
     }
 
-    // <ernie:tool_call>\n<invoke name="N">\n<parameter name="P">V</parameter>\n</invoke>\n</ernie:tool_call>
+    // <ernie:tool_call>\n<invoke name="N"><parameter name="P">V</parameter></invoke>\n</ernie:tool_call>
     program::grammar::ToolForm tool_form() const override {
         program::grammar::ToolForm f;
         f.call_open = "<ernie:tool_call>\n";
         f.call_close = "\n</ernie:tool_call>";
         f.fn_open = "<invoke name=\"";
-        f.fn_mid = "\">\n";
+        f.fn_mid = "\">";
         f.fn_close = "</invoke>";
         f.param_open = "<parameter name=\"";
         f.param_mid_text = "\">";
         f.param_mid_value = "\">";
-        f.param_close = "</parameter>\n";
+        f.param_close = "</parameter>";
         f.text_end = "</parameter>";
         f.calls_share_block = true;
         f.trigger = "<ernie:tool_call>";
         return f;
     }
 
+    program::grammar::ReplyForm reply_form() const override {
+        program::grammar::ReplyForm f;
+        f.think_open = "<ernie:think>";
+        f.think_close = "</ernie:think>";
+        return f;
+    }
+
     PreTokenizer pretokenizer() const override { return {"ernie55", pretok_ernie55}; }
     program::GpuModes gpu_modes() const override { return {kMaxSecondCards + 1, 0, 0}; }
-    const char* model_name() const override { return "ERNIE-5.5-Flash"; }
+    int max_slots() const override { return 8; }
+    const char* model_name(const core::Json&) const override { return "ERNIE-5.5-Flash"; }
     const char* community_kv() const override { return "fp8"; }
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
